@@ -3,7 +3,7 @@ import os, sys, re, json, time, threading, subprocess, zipfile, tempfile, shutil
 import urllib.request, urllib.parse
 
 APP_NAME = "FlowGet"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 GITHUB_REPO = "YOUR_USER/flowget"   # <-- set to your GitHub "user/repo" to enable auto-update
 
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
@@ -11,11 +11,16 @@ BIN = os.path.join(DATA, "bin")
 os.makedirs(BIN, exist_ok=True)
 YTDLP = os.path.join(BIN, "yt-dlp.exe")
 FFMPEG = os.path.join(BIN, "ffmpeg.exe")
+DENO = os.path.join(BIN, "deno.exe")
 LOG_FILE = os.path.join(DATA, "flowget.log")
 SETTINGS_FILE = os.path.join(DATA, "settings.json")
 QUEUE_FILE = os.path.join(DATA, "queue.json")
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 FFMPEG_URL = "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
+DENO_URL = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
+YTDLP_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+DENO_API = "https://api.github.com/repos/denoland/deno/releases/latest"
+FFMPEG_API = "https://api.github.com/repos/yt-dlp/FFmpeg-Builds/releases/latest"
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FlowGet"
 NOWIN = 0x08000000 if os.name == "nt" else 0
@@ -29,7 +34,8 @@ tools_ready = threading.Event()
 
 # ---------------------------------------------------------------- settings
 DEFAULTS = {"max_concurrent": 3, "connections": 8, "speed_kbps": 0, "folder": DEFAULT_DIR,
-            "cookies_browser": "", "clipboard": True, "notify": True}
+            "cookies_browser": "", "clipboard": True, "notify": True,
+            "auto_engine_update": True, "tools_checked": 0, "ffmpeg_built": ""}
 settings = dict(DEFAULTS)
 
 
@@ -240,6 +246,11 @@ def cookies_args():
     return ["--cookies-from-browser", b] if b else []
 
 
+def js_args():
+    """YouTube needs a JavaScript runtime; point yt-dlp at our bundled Deno."""
+    return ["--js-runtimes", f"deno:{DENO}"] if os.path.exists(DENO) else []
+
+
 def media_cmd(t):
     cmd = [YTDLP, "--newline", "--no-playlist", "--ffmpeg-location", BIN, "-P", t.folder,
            "-o", "%(title).150s.%(ext)s", "--retries", "10", "--fragment-retries", "10",
@@ -249,7 +260,7 @@ def media_cmd(t):
            "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.title)s"]
     if settings["speed_kbps"]:
         cmd += ["-r", f"{settings['speed_kbps']}K"]
-    cmd += cookies_args()
+    cmd += cookies_args() + js_args()
     if t.kind == "audio":
         cmd += ["-f", "ba/b", "-x", "--audio-format", t.fmt or "mp3", "--audio-quality", "0"]
     else:
@@ -308,7 +319,7 @@ def fetch_playlist(url):
     tools_ready.wait()
     if not os.path.exists(YTDLP):
         raise RuntimeError("Media engine missing")
-    out = subprocess.run([YTDLP, "-J", "--flat-playlist", "--no-warnings"] + cookies_args() + [url],
+    out = subprocess.run([YTDLP, "-J", "--flat-playlist", "--no-warnings"] + cookies_args() + js_args() + [url],
                          capture_output=True, text=True, encoding="utf-8", errors="replace",
                          timeout=180, creationflags=NOWIN)
     if out.returncode != 0:
@@ -330,27 +341,131 @@ def fetch_playlist(url):
     return d.get("title", ""), items
 
 
-def setup_tools(say):
+# ---------------------------------------------------------------- components (yt-dlp, Deno, ffmpeg)
+def _gh_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
+    return json.load(urllib.request.urlopen(req, timeout=20))
+
+
+def _run(cmd, timeout=30):
     try:
-        if not os.path.exists(YTDLP):
-            say("Downloading media engine (yt-dlp)...")
-            fetch(YTDLP_URL, YTDLP)
-        else:
-            say("Updating media engine...")
-            subprocess.run([YTDLP, "-U"], capture_output=True, timeout=120, creationflags=NOWIN)
-        if not os.path.exists(FFMPEG):
-            say("Downloading ffmpeg (one time, ~100 MB)...")
-            zp = os.path.join(tempfile.gettempdir(), "flowget_ff.zip")
-            fetch(FFMPEG_URL, zp)
-            with zipfile.ZipFile(zp) as z:
-                for n in z.namelist():
-                    if n.endswith(("/bin/ffmpeg.exe", "/bin/ffprobe.exe")):
-                        with z.open(n) as src, open(os.path.join(BIN, os.path.basename(n)), "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-            os.remove(zp)
-        say("Ready")
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, creationflags=NOWIN).stdout.strip()
+    except Exception:
+        return ""
+
+
+def ytdlp_version():
+    return _run([YTDLP, "--version"]) if os.path.exists(YTDLP) else ""
+
+
+def deno_version():
+    m = re.match(r"deno (\S+)", _run([DENO, "--version"]) if os.path.exists(DENO) else "")
+    return m.group(1) if m else ""
+
+
+def ffmpeg_latest():
+    d = _gh_json(FFMPEG_API)
+    a = next(x for x in d["assets"] if x["name"] == "ffmpeg-master-latest-win64-gpl.zip")
+    return a["updated_at"][:10]
+
+
+def _install_from_zip(url, wanted, say, label):
+    """Download a zip; put files named in `wanted` into BIN via atomic replace."""
+    zp = os.path.join(tempfile.gettempdir(), "flowget_dl.zip")
+    fetch(url, zp, lambda f: say(f"Downloading {label}: {int(f * 100)}%"))
+    try:
+        with zipfile.ZipFile(zp) as z:
+            for n in z.namelist():
+                base = os.path.basename(n)
+                if base.lower() in wanted:
+                    dst = os.path.join(BIN, base); tmp = dst + ".new"
+                    with z.open(n) as src, open(tmp, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    os.replace(tmp, dst)
+    finally:
+        try: os.remove(zp)
+        except OSError: pass
+
+
+def update_ytdlp(say=lambda m: None):
+    say("Updating yt-dlp...")
+    if os.path.exists(YTDLP):
+        _run([YTDLP, "-U"], 120)                                   # yt-dlp replaces itself
+    else:
+        tmp = YTDLP + ".new"; fetch(YTDLP_URL, tmp); os.replace(tmp, YTDLP)
+    settings["tools_checked"] = time.time(); save_settings()
+
+
+def install_deno(say=lambda m: None):
+    _install_from_zip(DENO_URL, {"deno.exe"}, say, "Deno")
+
+
+def install_ffmpeg(say=lambda m: None):
+    try: built = ffmpeg_latest()
+    except Exception: built = time.strftime("%Y-%m-%d")
+    _install_from_zip(FFMPEG_URL, {"ffmpeg.exe", "ffprobe.exe"}, say, "ffmpeg")
+    settings["ffmpeg_built"] = built; save_settings()
+
+
+def update_component(key, say=lambda m: None):
+    {"ytdlp": update_ytdlp, "deno": install_deno, "ffmpeg": install_ffmpeg}[key](say)
+
+
+def check_components():
+    """One row per component: key, name, installed, latest, update (bool), error, info."""
+    rows = []
+
+    def row(key, name, inst, lat, upd, err="", info=None):
+        rows.append({"key": key, "name": name, "installed": inst or "not installed", "latest": lat,
+                     "update": upd, "error": err, "info": info})
+    try:
+        r = latest_release()
+        row("app", f"{APP_NAME} app", VERSION, r["version"] if r else VERSION, bool(r), info=r)
     except Exception as e:
-        log.exception("tool setup"); say(f"Media engine setup failed: {e}")
+        row("app", f"{APP_NAME} app", VERSION, "?", False, str(e))
+    try:
+        inst = ytdlp_version(); lat = _gh_json(YTDLP_API)["tag_name"]
+        row("ytdlp", "yt-dlp (media engine)", inst, lat, not inst or vt(lat) > vt(inst))
+    except Exception as e:
+        row("ytdlp", "yt-dlp (media engine)", ytdlp_version(), "?", False, str(e))
+    try:
+        inst = deno_version(); lat = _gh_json(DENO_API)["tag_name"].lstrip("v")
+        row("deno", "Deno (YouTube support)", inst, lat, not inst or vt(lat) > vt(inst))
+    except Exception as e:
+        row("deno", "Deno (YouTube support)", deno_version(), "?", False, str(e))
+    try:
+        import datetime as dt
+        built = settings.get("ffmpeg_built", ""); lat = ffmpeg_latest(); have = os.path.exists(FFMPEG)
+        stale = (not have) or (not built) or (dt.date.fromisoformat(lat) - dt.date.fromisoformat(built)).days > 60
+        row("ffmpeg", "ffmpeg (converter)", f"build {built}" if have and built else ("" if not have else "installed"),
+            f"build {lat}", stale)
+    except Exception as e:
+        row("ffmpeg", "ffmpeg (converter)", "installed" if os.path.exists(FFMPEG) else "", "?", False, str(e))
+    return rows
+
+
+def setup_tools(say):
+    """Install anything missing; keep yt-dlp and Deno fresh (every 12h) when auto-update is on."""
+    failed = []
+
+    def step(label, fn):
+        try: fn()
+        except Exception as e:
+            log.exception(label); failed.append(label)
+    due = settings["auto_engine_update"] and time.time() - settings["tools_checked"] > 12 * 3600
+    try:
+        if not os.path.exists(YTDLP) or due:
+            say("Updating media engine..."); step("yt-dlp", lambda: update_ytdlp(say))
+        if not os.path.exists(DENO):
+            say("Downloading Deno (needed for YouTube)..."); step("Deno", lambda: install_deno(say))
+        elif due:
+            def refresh_deno():
+                if vt(_gh_json(DENO_API)["tag_name"]) > vt(deno_version() or "0"): install_deno(say)
+            step("Deno", refresh_deno)
+        if not os.path.exists(FFMPEG):
+            say("Downloading ffmpeg (one time, ~100 MB)..."); step("ffmpeg", lambda: install_ffmpeg(say))
+        say("Ready" if not failed else f"Ready - could not set up: {', '.join(failed)} (see log)")
     finally:
         tools_ready.set()
 

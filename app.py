@@ -4,7 +4,7 @@ from ctypes import c_int, c_uint, c_void_p, c_size_t, Structure
 from PySide6.QtCore import Qt, QTimer, Signal, QSize
 from PySide6.QtGui import QPainter, QLinearGradient, QRadialGradient, QColor
 from PySide6.QtWidgets import (QApplication, QWidget, QDialog, QDialogButtonBox, QVBoxLayout, QHBoxLayout,
-                               QFormLayout, QLabel, QPlainTextEdit, QComboBox, QLineEdit, QPushButton,
+                               QFormLayout, QGridLayout, QLabel, QPlainTextEdit, QComboBox, QLineEdit, QPushButton,
                                QListWidget, QListWidgetItem, QFileDialog, QMessageBox, QFrame, QProgressBar,
                                QSpinBox, QCheckBox, QSystemTrayIcon, QMenu, QStyle)
 import engine as E
@@ -148,11 +148,12 @@ class SettingsDialog(QDialog):
         s.cookies.setCurrentText(st["cookies_browser"] or "None")
         s.cookies.setToolTip("Use your logged-in browser session for age-restricted / members-only videos.\n"
                              "Firefox is the most reliable; newer Chrome/Edge versions can fail to share cookies.")
+        s.auto = QCheckBox("Keep yt-dlp and Deno up to date automatically"); s.auto.setChecked(st["auto_engine_update"])
         s.clip = QCheckBox("Detect links copied to the clipboard"); s.clip.setChecked(st["clipboard"])
         s.notify = QCheckBox("Show notifications when downloads finish"); s.notify.setChecked(st["notify"])
         f.addRow("Downloads at once", s.maxc); f.addRow("Connections per file", s.conns)
         f.addRow("Speed limit", s.speed); f.addRow("Default folder", fr)
-        f.addRow("Use cookies from", s.cookies); f.addRow("", s.clip); f.addRow("", s.notify)
+        f.addRow("Use cookies from", s.cookies); f.addRow("", s.auto); f.addRow("", s.clip); f.addRow("", s.notify)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(s.accept); bb.rejected.connect(s.reject); f.addRow(bb)
 
@@ -164,8 +165,79 @@ class SettingsDialog(QDialog):
         c = s.cookies.currentText()
         E.settings.update(max_concurrent=s.maxc.value(), connections=s.conns.value(), speed_kbps=s.speed.value(),
                           folder=s.folder.text().strip() or E.DEFAULT_DIR, cookies_browser="" if c == "None" else c,
-                          clipboard=s.clip.isChecked(), notify=s.notify.isChecked())
+                          clipboard=s.clip.isChecked(), notify=s.notify.isChecked(),
+                          auto_engine_update=s.auto.isChecked())
         E.save_settings()
+
+
+class ComponentsDialog(QDialog):
+    got = Signal(list)
+    msg = Signal(str)
+
+    def __init__(s, parent):
+        super().__init__(parent); s.main = parent; s._note = ""; s.cells = []
+        s.setWindowTitle("Updates & components"); s.setMinimumWidth(720)
+        lay = QVBoxLayout(s); lay.setContentsMargins(20, 18, 20, 16); lay.setSpacing(12)
+        s.grid = QGridLayout(); s.grid.setHorizontalSpacing(22); s.grid.setVerticalSpacing(12)
+        for c, h in enumerate(("Component", "Installed", "Latest", "")):
+            l = QLabel(h); l.setObjectName("muted"); s.grid.addWidget(l, 0, c)
+        s.grid.setColumnStretch(0, 1); lay.addLayout(s.grid)
+        try:
+            import PySide6; qt = PySide6.__version__
+        except Exception:
+            qt = "?"
+        info = QLabel(f"Built with Python {sys.version.split()[0]} and PySide6 {qt}. These are bundled inside "
+                      "FlowGet, so they update when a new FlowGet release is installed. yt-dlp, Deno and ffmpeg "
+                      "are separate downloads and are updated here.")
+        info.setObjectName("muted"); info.setWordWrap(True); lay.addWidget(info)
+        s.state = QLabel("Checking..."); lay.addWidget(s.state)
+        row = QHBoxLayout(); again = QPushButton("Check again"); again.clicked.connect(s.check)
+        close = QPushButton("Close"); close.clicked.connect(s.accept)
+        row.addWidget(again); row.addStretch(1); row.addWidget(close); lay.addLayout(row)
+        s.got.connect(s.fill); s.msg.connect(s.state.setText)
+        s.check()
+
+    def check(s):
+        s.state.setText("Checking...")
+        def work():
+            try: s.got.emit(E.check_components())
+            except RuntimeError: pass                                 # dialog already closed
+        threading.Thread(target=work, daemon=True).start()
+
+    def fill(s, rows):
+        for w in s.cells:
+            s.grid.removeWidget(w); w.deleteLater()
+        s.cells = []
+        for i, r in enumerate(rows, 1):
+            name = QLabel(r["name"]); name.setStyleSheet("font-weight:600;")
+            inst = QLabel(r["installed"]); lat = QLabel("check failed" if r["error"] else r["latest"])
+            if r["error"]: lat.setToolTip(r["error"])
+            if r["update"]:
+                w = QPushButton("Update"); w.setObjectName("accent")
+                w.clicked.connect(lambda _=False, r=r: s.apply(r))
+            else:
+                w = QLabel("-" if r["error"] else "Up to date")
+            for c, x in enumerate((name, inst, lat, w)):
+                s.grid.addWidget(x, i, c); s.cells.append(x)
+        n = sum(1 for r in rows if r["update"])
+        s.state.setText(s._note + (f"{n} update(s) available" if n else "Everything is up to date"))
+        s._note = ""
+        s.main.update_badge(rows)
+
+    def apply(s, r):
+        if r["key"] == "app":
+            s.accept(); s.main.offer(r["info"]); return
+        for w in s.cells:
+            if isinstance(w, QPushButton): w.setEnabled(False)
+        s.state.setText(f"Updating {r['name']}...")
+        def work():
+            try:
+                E.update_component(r["key"], s.msg.emit); s._note = f"{r['name']} updated.  "
+            except Exception as e:
+                s._note = f"Update failed: {e}  "
+            try: s.got.emit(E.check_components())
+            except RuntimeError: pass
+        threading.Thread(target=work, daemon=True).start()
 
 
 class PlaylistDialog(QDialog):
@@ -202,7 +274,7 @@ class PlaylistDialog(QDialog):
 
 class Main(QWidget):
     sig_msg = Signal(str)
-    sig_update = Signal(object)
+    sig_components = Signal(list)
     sig_playlist = Signal(str, list)
     sig_quit = Signal()
 
@@ -211,6 +283,7 @@ class Main(QWidget):
         s.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         s.setWindowTitle(f"{E.APP_NAME} {E.VERSION}"); s.resize(1020, 720); s.setMinimumSize(780, 560)
         s.blur = False; s._blurred = False; s.rows = []; s._quitting = False; s._lastclip = ""
+        s.components = []; s._advised = set(); s._app_prompted = False
         icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown)
         s.setWindowIcon(icon)
 
@@ -220,8 +293,8 @@ class Main(QWidget):
         s.status = QLabel("Starting..."); s.status.setObjectName("muted")
         s.status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         st = QPushButton("Settings"); st.clicked.connect(s.open_settings)
-        up = QPushButton("Check for updates"); up.clicked.connect(lambda: s.check_update(True))
-        head.addWidget(t); head.addStretch(1); head.addWidget(s.status); head.addWidget(st); head.addWidget(up)
+        s.upd_btn = QPushButton("Updates"); s.upd_btn.clicked.connect(s.open_updates)
+        head.addWidget(t); head.addStretch(1); head.addWidget(s.status); head.addWidget(st); head.addWidget(s.upd_btn)
         root.addLayout(head)
 
         add = Card(); al = QVBoxLayout(add); al.setContentsMargins(16, 14, 16, 14); al.setSpacing(10)
@@ -264,14 +337,15 @@ class Main(QWidget):
         s.tray.activated.connect(lambda r: s.show_normal() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
         if s.tray_ok: s.tray.show()
 
-        s.sig_msg.connect(s.status.setText); s.sig_update.connect(s.offer)
+        s.sig_msg.connect(s.status.setText); s.sig_components.connect(s.on_components)
         s.sig_playlist.connect(s.on_playlist); s.sig_quit.connect(s.quit_app)
         QApplication.clipboard().dataChanged.connect(s.on_clip)
 
         for task in E.load_queue():                                   # restore previous session
             s.add_task(task)
         threading.Thread(target=E.setup_tools, args=(s.sig_msg.emit,), daemon=True).start()
-        QTimer.singleShot(4000, lambda: s.check_update(False))
+        QTimer.singleShot(4000, s.check_components)
+        s.comp_timer = QTimer(s); s.comp_timer.timeout.connect(s.check_components); s.comp_timer.start(12 * 3600 * 1000)
         s.timer = QTimer(s); s.timer.timeout.connect(s.tick); s.timer.start(500)
         s.saver = QTimer(s); s.saver.timeout.connect(s.save); s.saver.start(5000)
 
@@ -423,15 +497,37 @@ class Main(QWidget):
             s.sig_msg.emit("Link detected from clipboard - press Add downloads")
 
     # ---- app auto-update (checksum verified)
-    def check_update(s, manual):
+    def open_updates(s):
+        ComponentsDialog(s).exec()
+
+    def check_components(s):
         def work():
             try:
-                info = E.latest_release()
-                if info: s.sig_update.emit(info)
-                elif manual: s.sig_msg.emit("You're on the latest version.")
-            except Exception as e:
-                if manual: s.sig_msg.emit(f"Update check failed: {e}")
+                E.tools_ready.wait()
+                s.sig_components.emit(E.check_components())
+            except Exception:
+                pass
         threading.Thread(target=work, daemon=True).start()
+
+    def update_badge(s, rows):
+        s.components = rows
+        n = sum(1 for r in rows if r["update"])
+        s.upd_btn.setText(f"Updates ({n})" if n else "Updates")
+
+    def on_components(s, rows):
+        s.update_badge(rows)
+        pending = [r for r in rows if r["update"]]
+        keys = {r["key"] for r in pending}
+        if keys and keys != s._advised:                               # advise once per change
+            s._advised = keys
+            label = ", ".join(r["name"] for r in pending)
+            s.sig_msg.emit(f"Updates available: {label}")
+            if E.settings["notify"] and s.tray_ok:
+                s.tray.showMessage("Updates available", label + "\nOpen Updates in FlowGet to install.",
+                                   QSystemTrayIcon.MessageIcon.Information, 6000)
+        app = next((r for r in pending if r["key"] == "app"), None)
+        if app and app["info"] and not s._app_prompted:
+            s._app_prompted = True; s.offer(app["info"])
 
     def offer(s, info):
         if QMessageBox.question(s, E.APP_NAME, f"Version {info['version']} is available. Update now?\n"

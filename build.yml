@@ -1,0 +1,75 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]          # tagging v1.2.0 builds and publishes a release
+  pull_request:           # Dependabot PRs get a full test build before you merge
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Stamp version and repo from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: python
+        run: |
+          import os, re
+          v = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          def sub(path, pat, rep):
+              text = open(path, encoding="utf-8").read()
+              text, n = re.subn(pat, lambda m: rep, text, flags=re.M)
+              assert n == 1, (path, pat)
+              open(path, "w", encoding="utf-8").write(text)
+          sub("engine.py", r'^VERSION = ".*"', 'VERSION = "' + v + '"')
+          sub("engine.py", r'^GITHUB_REPO = ".*?"', 'GITHUB_REPO = "' + repo + '"')
+          sub("installer.iss", r'^#define MyAppVersion ".*"', '#define MyAppVersion "' + v + '"')
+
+      - name: Smoke test (imports)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -c "import engine, app; print('imports ok', engine.VERSION)"
+
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm --onefile --windowed --name FlowGet app.py
+
+      - name: Build installer
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist\FlowGet-Setup.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  FlowGet-Setup.exe" | Out-File -Encoding ascii dist\FlowGet-Setup.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlowGet-Setup
+          path: |
+            dist/FlowGet-Setup.exe
+            dist/FlowGet-Setup.exe.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/FlowGet-Setup.exe
+            dist/FlowGet-Setup.exe.sha256
+          generate_release_notes: true

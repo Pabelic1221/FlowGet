@@ -1,5 +1,5 @@
 #define MyAppName "FlowGet"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 
 [Setup]
 AppId={{6F1D2C3B-8A47-4E59-B0C2-1A9E5D7F3B42}
