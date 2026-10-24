@@ -4,7 +4,7 @@ import urllib.request, urllib.parse
 
 APP_NAME = "FlowGet"
 VERSION = "1.2.0"
-GITHUB_REPO = "YOUR_USER/flowget"   # <-- set to your GitHub "user/repo" to enable auto-update
+GITHUB_REPO = "Pabelic1221/FlowGet"   # <-- set to your GitHub "user/repo" to enable auto-update
 
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
 BIN = os.path.join(DATA, "bin")

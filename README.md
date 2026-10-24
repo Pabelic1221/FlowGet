@@ -2,9 +2,7 @@
 
 A multi-connection download manager for Windows with a glassmorphism UI. It downloads regular files over parallel connections, and video and audio from sites supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 
-![build](https://github.com/YOUR_USER/flowget/actions/workflows/build.yml/badge.svg)
-
-> Replace `YOUR_USER` above with your GitHub username. Add a screenshot here once you have one: `![FlowGet](docs/screenshot.png)`
+![build](https://github.com/Pabelic1221/FlowGet/actions/workflows/build.yml/badge.svg)
 
 ## Features
 
