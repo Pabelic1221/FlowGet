@@ -1,151 +1,75 @@
-<p align="center">
-  <img src="assets/logo.svg" alt="FlowGet" width="440">
-</p>
 
-A multi-connection download manager for Windows with a glassmorphism UI. It downloads regular files over parallel connections, and video and audio from sites supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+<p align="center"> <img src="files-logo/logo.svg" alt="FlowGet" width="440"> </p> <p align="center"> A multi-connection download manager for Windows with a modern glassmorphism UI. <br> Download files using parallel connections, or grab video and audio from sites supported by <a href="https://github.com/yt-dlp/yt-dlp">yt-dlp</a>. </p> <p align="center"> <img src="https://github.com/Pabelic1221/FlowGet/actions/workflows/build.yml/badge.svg" alt="Build Status"> </p>
+Features
+Downloading
 
-![build](https://github.com/Pabelic1221/FlowGet/actions/workflows/build.yml/badge.svg)
+Segmented downloads with up to 16 parallel connections (8 by default), when supported by the server.
+Pause, resume, and retry downloads without losing progress.
+Download queue with configurable simultaneous downloads and speed limits.
+Disk-space checks before large downloads.
+Video and audio downloads from YouTube and other websites supported by yt-dlp.
+Video quality selection (Best, 1080p, 720p, 480p, 360p) and supported formats (MP4, MKV, WebM, MP3, M4A, Opus, FLAC).
+Playlist support with selectable items.
+Optional browser cookies for content requiring authentication.
+Application
 
-> Add a screenshot here once you have one: `![FlowGet](docs/screenshot.png)`
->
-> For a nicer link preview, upload `assets/social-preview.png` under the repo's **Settings, General, Social preview**.
+Modern glassmorphism interface built with PySide6.
+Light and dark themes, with a System option.
+System tray icon and download completion notifications.
+Clipboard link detection for quick downloads.
+Settings and logging for troubleshooting.
+Updates
 
-## Features
+In-app updates for FlowGet, yt-dlp, Deno, and FFmpeg.
+Installer updates verified with SHA-256 checksums.
+Installation
+Visit the FlowGet Releases page.
+Download the latest FlowGet-Setup.exe.
+Run the installer and follow the instructions.
+Launch FlowGet and wait until the status displays Ready before downloading video or audio.
+On first launch, FlowGet downloads yt-dlp, Deno, and FFmpeg automatically (approximately 100 MB, one time).
 
-**Downloading**
-- Segmented downloads: each file is split across up to 16 parallel connections (default 8) when the server supports range requests
-- Pause, resume and retry with backoff. The queue and exact resume positions are saved, so downloads survive closing the app or a crash
-- Queue with a configurable number of simultaneous downloads, plus a global speed limit
-- Disk-space check before large downloads
-- Video and audio from YouTube and the other sites yt-dlp supports
-- Quality choice (best, 1080p, 720p, 480p, 360p), video formats (MP4, MKV, WebM) and audio formats (MP3, M4A, Opus, FLAC)
-- Playlists: paste a link and pick which items to download
-- Optional browser cookies (Firefox, Chrome, Edge, Brave, Opera) for age-restricted or members-only content
-
-**App**
-- Glass UI built with PySide6: native acrylic blur on Windows 10 and 11, with a dark gradient fallback where blur isn't available
-- Light and dark themes: click the **FlowGet** title to switch modes, or choose **System** in Settings to follow Windows
-- Tray icon, completion notifications, clipboard link detection, double-click to open a finished file
-- Settings dialog and a log file for troubleshooting
-
-**Updates**
-- In-app **Updates** window for FlowGet, yt-dlp, Deno and ffmpeg (see [How updates work](#how-updates-work))
-- Installer updates are verified against a published SHA-256 checksum before they run
-
-## Requirements
-
-- Windows 10 or 11. The strongest blur effect needs Windows 11 22H2 or newer.
-- To run from source or build: Python 3.10 or newer. CI builds with 3.13.
-- To build the installer: [Inno Setup 6](https://jrsoftware.org/isinfo.php)
-
-## Run from source
-
-```powershell
+Requirements
+Windows 10 or Windows 11.
+Python 3.10 or newer, if running from source.
+Inno Setup 6, if building the installer yourself.
+Run from Source
 git clone https://github.com/Pabelic1221/FlowGet.git
-cd flowget
+cd FlowGet
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 py -m pip install -r requirements.txt
 py app.py
-```
+Build the Installer
+If you want to build the installer yourself, run:
 
-On first launch FlowGet downloads yt-dlp, Deno and ffmpeg (about 100 MB, once) into `%LOCALAPPDATA%\FlowGet\bin`. Wait for the status line to say **Ready** before downloading video or audio.
-
-## Build the installer
-
-```powershell
 build.bat
-```
+The installer and checksum are generated in the dist folder.
 
-This produces `dist\FlowGet-Setup.exe` and `dist\FlowGet-Setup.exe.sha256`. The installer is per-user (no admin prompt) and installs to `%LOCALAPPDATA%\Programs\FlowGet`.
+Troubleshooting
+Problem	Try
+Video or audio downloads fail after launch	Wait until the status displays Ready, then retry.
+YouTube asks you to sign in	Enable Use cookies from in Settings.
+Some servers reject downloads	Lower Connections per file in Settings.
+Blur effect is missing	Enable Windows transparency effects.
+Antivirus flags the executable	PyInstaller one-file builds can trigger false positives; investigate detections before running the file.
+Known Limitations
+No browser extension yet.
+No download scheduler.
+Some direct links requiring special authentication or headers may not be supported.
+The application is an early release and may have rough edges.
+Responsible Use
+Only download content you own or have permission to download. Respect the terms of service of the websites you use. DRM-protected services such as Spotify are not supported, and FlowGet does not support circumventing DRM.
 
-`GITHUB_REPO` in `engine.py` tells the app where to look for updates. Released builds get it stamped in automatically by CI.
+Third-Party Software
+Project	License
+PySide6 / Qt	LGPLv3, GPLv3, or commercial
+yt-dlp	Unlicense
+Deno	MIT
+FFmpeg	LGPL/GPL, depending on the build
+PyInstaller	GPLv2+ with a bootloader exception
+Inno Setup	Inno Setup license
+License
+Add your chosen license to the repository in a LICENSE file, then update this section to identify it.
 
-## Release a new version
-
-1. Merge your changes to `main`.
-2. Tag and push:
-   ```powershell
-   git tag v1.2.1
-   git push origin v1.2.1
-   ```
-3. GitHub Actions builds the installer, creates the checksum file and publishes a GitHub Release with both files attached.
-4. Installed copies of FlowGet offer the update at their next launch.
-
-Both `FlowGet-Setup.exe` and `FlowGet-Setup.exe.sha256` must be on the release. Without the checksum file, the app refuses to install the update.
-
-## How updates work
-
-| Component | Where it lives | How it stays current |
-|---|---|---|
-| yt-dlp | `%LOCALAPPDATA%\FlowGet\bin` | Updated automatically about every 12 hours (can be turned off in Settings) |
-| Deno | same folder | Updated automatically. YouTube extraction needs a JavaScript runtime and FlowGet points yt-dlp at this copy |
-| ffmpeg | same folder | You are advised when the build is over 60 days old and update from the Updates window |
-| FlowGet | installed app | Prompts when a newer GitHub Release exists, verifies the checksum, installs silently and restarts |
-| Python, PySide6 | bundled inside the exe | Cannot change after the build. Dependabot proposes newer pinned versions, CI test-builds them, and a new release delivers them |
-
-## Project layout
-
-```
-app.py                         UI (PySide6): window, dialogs, tray
-engine.py                      downloads, yt-dlp integration, settings, queue, updates
-installer.iss                  Inno Setup installer script
-assets/                        icon (SVG, PNG, ICO), logo and GitHub social preview
-build.bat                      local build: exe, installer, checksum
-requirements.txt               pinned build dependencies
-.github/workflows/build.yml    CI: test build on PRs, release build on tags
-.github/dependabot.yml         weekly dependency update pull requests
-```
-
-## Where data is stored
-
-| What | Location |
-|---|---|
-| Settings, queue, log | `%LOCALAPPDATA%\FlowGet\` (`settings.json`, `queue.json`, `flowget.log`) |
-| yt-dlp, Deno, ffmpeg | `%LOCALAPPDATA%\FlowGet\bin\` |
-| Downloaded files | your Downloads folder by default (change in Settings) |
-
-The data folder is not removed on uninstall. Delete it by hand to reset everything.
-
-## Troubleshooting
-
-| Problem | Try |
-|---|---|
-| Video or audio downloads fail right after launch | Wait for the status line to say **Ready**, then retry |
-| A site stopped working | Open **Updates** and update yt-dlp. Check `flowget.log` for the full error |
-| YouTube asks you to sign in or confirm you're not a bot | Settings, then **Use cookies from**, then pick your browser. Firefox is the most reliable |
-| Some servers reject downloads | Lower **Connections per file** in Settings |
-| No blur effect | Turn on Windows transparency effects. Otherwise the app uses its dark gradient fallback |
-| Update says there is no checksum file | Upload `FlowGet-Setup.exe.sha256` to the release |
-| Antivirus flags the exe | This is a common false positive with PyInstaller `--onefile`. A `--onedir` build reduces it |
-
-## Known limitations
-
-- No browser extension yet (the "download this" button on web pages)
-- No download scheduler
-- The UI uses a stock tray icon and no custom title bar
-- Direct links that need a login, special headers or cookies are not supported
-- Early release: the UI has had limited testing, so expect rough edges
-
-## Responsible use
-
-Only download content you own or have permission to download. Many sites' terms of service prohibit downloading. DRM-protected services such as Spotify are not supported and this project will not add support for circumventing DRM.
-
-## Third-party software
-
-FlowGet builds on, or downloads at runtime, these projects. Check each license before redistributing.
-
-| Project | License |
-|---|---|
-| [PySide6 / Qt](https://doc.qt.io/qtforpython-6/) | LGPLv3, GPLv3 or commercial |
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense |
-| [Deno](https://github.com/denoland/deno) | MIT |
-| [FFmpeg](https://ffmpeg.org/) (builds from [yt-dlp/FFmpeg-Builds](https://github.com/yt-dlp/FFmpeg-Builds)) | LGPL/GPL depending on the build. FlowGet downloads the GPL build at runtime and does not bundle it |
-| [PyInstaller](https://pyinstaller.org/) | GPLv2+ with a bootloader exception |
-| [Inno Setup](https://jrsoftware.org/isinfo.php) | Inno Setup license |
-
-If you distribute FlowGet, review the LGPL requirements for Qt. A `--onedir` build makes it easier to let users replace the Qt libraries. This is not legal advice.
-
-## License
-
-Choose a license for your own code before publishing (for example MIT) and add a `LICENSE` file, then state it here.
+⋮⋮⋮⋮⋮⋮⋮⋮
