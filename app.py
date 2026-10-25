@@ -1,7 +1,7 @@
 """FlowGet - glassmorphism UI (PySide6). Download logic lives in engine.py."""
 import os, sys, ctypes, tempfile, subprocess, threading, urllib.parse
-from ctypes import c_int, c_uint, c_void_p, c_size_t, Structure
-from PySide6.QtCore import Qt, QTimer, Signal, QSize
+from ctypes import c_int, c_uint, c_void_p, c_size_t, Structure, wintypes
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QPoint, QEvent
 from PySide6.QtGui import QPainter, QLinearGradient, QRadialGradient, QColor, QIcon
 from PySide6.QtWidgets import (QApplication, QWidget, QDialog, QDialogButtonBox, QVBoxLayout, QHBoxLayout,
                                QFormLayout, QGridLayout, QLabel, QPlainTextEdit, QComboBox, QLineEdit, QPushButton,
@@ -40,7 +40,13 @@ QSS_T = """
 QDialog { background: @dialog_bg@; }
 QFrame#card { background: @card_bg@; border: 1px solid @card_border@; border-radius: 18px; }
 QLabel { background: transparent; border: none; }
-QLabel#title { font-size: 26px; font-weight: 700; }
+QPushButton#title { font-size: 26px; font-weight: 700; background: transparent; border: none; padding: 0; text-align: left; }
+QPushButton#title:hover { color: #a78bfa; }
+QWidget#titleBar { background: transparent; }
+QLabel#windowTitle { font-size: 12px; font-weight: 600; background: transparent; }
+QPushButton#windowControl { background: transparent; border: none; border-radius: 6px; padding: 0; font-size: 15px; }
+QPushButton#windowControl:hover { background: rgba(255,255,255,35); }
+QPushButton#closeControl:hover { background: #c42b1c; color: #ffffff; }
 QLabel#muted { color: @muted@; font-size: 12px; }
 QPlainTextEdit, QLineEdit, QSpinBox { background: @input_bg@; border: 1px solid @input_border@;
     border-radius: 12px; padding: 7px 9px; selection-background-color: #7c6cf0; selection-color: #ffffff; }
@@ -335,24 +341,45 @@ class Main(QWidget):
     def __init__(s):
         super().__init__()
         s.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        s._frameless = sys.platform == "win32"
+        if s._frameless:
+            s.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         s.setWindowTitle(f"{E.APP_NAME} {E.VERSION}"); s.resize(1020, 720); s.setMinimumSize(780, 560)
         s.blur = False; s._blurred = False; s.dark = True; s.rows = []; s._quitting = False; s._lastclip = ""
         s.components = []; s._advised = set(); s._app_prompted = False
         icon = app_icon()
         s.setWindowIcon(icon)
 
-        root = QVBoxLayout(s); root.setContentsMargins(22, 18, 22, 18); root.setSpacing(14)
+        root = QVBoxLayout(s); root.setContentsMargins(0, 0, 0, 12); root.setSpacing(0)
+        if s._frameless:
+            s.titlebar = QWidget(); s.titlebar.setObjectName("titleBar"); s.titlebar.setFixedHeight(38)
+            titlebar = QHBoxLayout(s.titlebar); titlebar.setContentsMargins(22, 4, 12, 0); titlebar.setSpacing(4)
+            caption = QLabel(f"{E.APP_NAME} {E.VERSION}"); caption.setObjectName("windowTitle")
+            titlebar.addWidget(caption); titlebar.addStretch(1)
+            s.minimize_btn = QPushButton("\u2212"); s.minimize_btn.setObjectName("windowControl")
+            s.minimize_btn.setToolTip("Minimize"); s.minimize_btn.setAccessibleName("Minimize window")
+            s.minimize_btn.setFixedSize(38, 30); s.minimize_btn.clicked.connect(s.showMinimized)
+            s.maximize_btn = QPushButton(); s.maximize_btn.setObjectName("windowControl")
+            s.maximize_btn.setFixedSize(38, 30); s.maximize_btn.clicked.connect(s.toggle_maximized)
+            s.close_btn = QPushButton("\u00d7"); s.close_btn.setObjectName("closeControl")
+            s.close_btn.setToolTip("Close"); s.close_btn.setAccessibleName("Close window")
+            s.close_btn.setFixedSize(38, 30); s.close_btn.clicked.connect(s.close)
+            titlebar.addWidget(s.minimize_btn); titlebar.addWidget(s.maximize_btn); titlebar.addWidget(s.close_btn)
+            root.addWidget(s.titlebar)
+            s.update_window_controls()
+        body = QWidget(s)
+        content = QVBoxLayout(body); content.setContentsMargins(22, 14, 22, 18); content.setSpacing(14)
         head = QHBoxLayout(); head.setSpacing(8)
-        t = QLabel(E.APP_NAME); t.setObjectName("title")
+        s.title_toggle = QPushButton(E.APP_NAME); s.title_toggle.setObjectName("title")
+        s.title_toggle.setAccessibleName("Toggle light and dark theme")
+        s.title_toggle.clicked.connect(s.toggle_theme)
         s.status = QLabel("Starting..."); s.status.setObjectName("muted")
         s.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         s.status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         st = QPushButton("Settings"); st.clicked.connect(s.open_settings)
         s.upd_btn = QPushButton("Updates"); s.upd_btn.clicked.connect(s.open_updates)
-        s.theme_btn = QPushButton(); s.theme_btn.setToolTip("Switch between light and dark mode")
-        s.theme_btn.clicked.connect(s.toggle_theme)
-        head.addWidget(t); head.addWidget(s.status, 1); head.addWidget(s.theme_btn); head.addWidget(st); head.addWidget(s.upd_btn)
-        root.addLayout(head)
+        head.addWidget(s.title_toggle); head.addWidget(s.status, 1); head.addWidget(st); head.addWidget(s.upd_btn)
+        content.addLayout(head)
 
         add = Card(); al = QVBoxLayout(add); al.setContentsMargins(16, 14, 16, 14); al.setSpacing(10)
         s.txt = QPlainTextEdit(); s.txt.setFixedHeight(84)
@@ -372,25 +399,26 @@ class Main(QWidget):
         br = QPushButton("Browse"); br.clicked.connect(s.browse)
         go = QPushButton("Add downloads"); go.setObjectName("accent"); go.clicked.connect(s.add_urls)
         dest.addWidget(s.folder, 1); dest.addWidget(br); dest.addWidget(go); al.addLayout(dest)
-        root.addWidget(add)
+        content.addWidget(add)
 
         bar = QHBoxLayout(); bar.setSpacing(8)
         for label, fn in (("Pause", s.pause), ("Resume", s.resume), ("Remove", s.remove),
                           ("Clear completed", s.clear_done), ("Show in folder", s.open_folder)):
             b = QPushButton(label); b.clicked.connect(fn); bar.addWidget(b)
-        bar.addStretch(1); root.addLayout(bar)
+        bar.addStretch(1); content.addLayout(bar)
 
         s.list = QListWidget(); s.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         s.list.setSpacing(6); s.list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         s.list.itemDoubleClicked.connect(s.open_item)
-        root.addWidget(s.list, 1)
+        content.addWidget(s.list, 1)
 
         credit = QLabel('Made with <span style="color:#f43f5e;">&#10084;&#65039;</span> by '
                         '<a href="https://github.com/Pabelic1221" style="color:#f43f5e; text-decoration:none;">'
                         'Jushua Pabelic</a>')
         credit.setObjectName("muted"); credit.setTextFormat(Qt.TextFormat.RichText)
         credit.setOpenExternalLinks(True)
-        foot = QHBoxLayout(); foot.addWidget(credit); foot.addStretch(1); root.addLayout(foot)
+        foot = QHBoxLayout(); foot.addWidget(credit); foot.addStretch(1); content.addLayout(foot)
+        root.addWidget(body, 1)
 
         # tray icon (notifications + keep downloading in background)
         s.tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
@@ -424,7 +452,7 @@ class Main(QWidget):
         s.dark = resolve_theme(E.settings["theme"]) == "dark"
         CUR["pal"] = DARK if s.dark else LIGHT
         QApplication.instance().setStyleSheet(build_qss(CUR["pal"]))
-        s.theme_btn.setText("\u2600 Light" if s.dark else "\u263E Dark")      # shows the mode you switch TO
+        s.title_toggle.setToolTip("Click to switch to light mode" if s.dark else "Click to switch to dark mode")
         if s._blurred:
             s.blur = enable_blur(int(s.winId()), s.dark)
         s.update()
@@ -432,6 +460,46 @@ class Main(QWidget):
     def toggle_theme(s):
         E.settings["theme"] = "light" if s.dark else "dark"; E.save_settings()
         s.apply_theme()
+
+    def update_window_controls(s):
+        if not s._frameless:
+            return
+        maximized = s.isMaximized()
+        s.maximize_btn.setText("\u2750" if maximized else "\u25a1")
+        s.maximize_btn.setToolTip("Restore" if maximized else "Maximize")
+        s.maximize_btn.setAccessibleName("Restore window" if maximized else "Maximize window")
+
+    def toggle_maximized(s):
+        s.showNormal() if s.isMaximized() else s.showMaximized()
+        s.update_window_controls()
+
+    def changeEvent(s, e):
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.WindowStateChange:
+            s.update_window_controls()
+
+    def nativeEvent(s, event_type, message):
+        if s._frameless and event_type == b"windows_generic_MSG":
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == 0x0084:                               # WM_NCHITTEST
+                pos = s.mapFromGlobal(QPoint(msg.pt.x, msg.pt.y))
+                if not s.isMaximized():
+                    left, right = pos.x() < 8, pos.x() >= s.width() - 8
+                    top, bottom = pos.y() < 8, pos.y() >= s.height() - 8
+                    if top and left: return True, 13                # HTTOPLEFT
+                    if top and right: return True, 14               # HTTOPRIGHT
+                    if bottom and left: return True, 16             # HTBOTTOMLEFT
+                    if bottom and right: return True, 17            # HTBOTTOMRIGHT
+                    if left: return True, 10                        # HTLEFT
+                    if right: return True, 11                       # HTRIGHT
+                    if top: return True, 12                          # HTTOP
+                    if bottom: return True, 15                       # HTBOTTOM
+                title_pos = s.titlebar.mapFrom(s, pos)
+                if s.titlebar.rect().contains(title_pos):
+                    if not any(b.geometry().contains(title_pos) for b in
+                               (s.minimize_btn, s.maximize_btn, s.close_btn)):
+                        return True, 2                               # HTCAPTION
+        return super().nativeEvent(event_type, message)
 
     def showEvent(s, e):
         super().showEvent(e)

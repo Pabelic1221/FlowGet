@@ -24,7 +24,7 @@ A multi-connection download manager for Windows with a glassmorphism UI. It down
 
 **App**
 - Glass UI built with PySide6: native acrylic blur on Windows 10 and 11, with a dark gradient fallback where blur isn't available
-- Light and dark themes: switch with the header button, or choose **System** in Settings to follow Windows
+- Light and dark themes: click the **FlowGet** title to switch modes, or choose **System** in Settings to follow Windows
 - Tray icon, completion notifications, clipboard link detection, double-click to open a finished file
 - Settings dialog and a log file for troubleshooting
 
