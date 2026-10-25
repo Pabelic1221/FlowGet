@@ -2,65 +2,116 @@
 import os, sys, ctypes, tempfile, subprocess, threading, urllib.parse
 from ctypes import c_int, c_uint, c_void_p, c_size_t, Structure
 from PySide6.QtCore import Qt, QTimer, Signal, QSize
-from PySide6.QtGui import QPainter, QLinearGradient, QRadialGradient, QColor
+from PySide6.QtGui import QPainter, QLinearGradient, QRadialGradient, QColor, QIcon
 from PySide6.QtWidgets import (QApplication, QWidget, QDialog, QDialogButtonBox, QVBoxLayout, QHBoxLayout,
                                QFormLayout, QGridLayout, QLabel, QPlainTextEdit, QComboBox, QLineEdit, QPushButton,
                                QListWidget, QListWidgetItem, QFileDialog, QMessageBox, QFrame, QProgressBar,
-                               QSpinBox, QCheckBox, QSystemTrayIcon, QMenu, QStyle)
+                               QSpinBox, QCheckBox, QSystemTrayIcon, QMenu, QStyle, QSizePolicy)
 import engine as E
 
 QUALITY = [("Best", "best"), ("1080p", "1080"), ("720p", "720"), ("480p", "480"), ("360p", "360")]
 VFMT = ["mp4", "mkv", "webm"]
 AFMT = ["mp3", "m4a", "opus", "flac"]
 
-QSS = """
-* { font-family: 'Segoe UI Variable Text','Segoe UI',sans-serif; font-size: 13px; color: #f2f2fa; }
-QDialog { background: #17162b; }
-QFrame#card { background: rgba(255,255,255,20); border: 1px solid rgba(255,255,255,48); border-radius: 18px; }
+DARK = dict(
+    text="#f2f2fa", muted="rgba(242,242,250,150)", disabled="rgba(242,242,250,70)",
+    card_bg="rgba(255,255,255,20)", card_border="rgba(255,255,255,48)",
+    input_bg="rgba(0,0,0,70)", input_border="rgba(255,255,255,40)",
+    btn_bg="rgba(255,255,255,24)", btn_border="rgba(255,255,255,55)",
+    btn_hover="rgba(255,255,255,44)", btn_press="rgba(255,255,255,16)",
+    popup_bg="#1d1b30", popup_border="rgba(255,255,255,40)", dialog_bg="#17162b",
+    check_bg="rgba(0,0,0,70)", check_border="rgba(255,255,255,90)",
+    item_sel="rgba(139,92,246,60)", bar_bg="rgba(255,255,255,28)", scroll="rgba(255,255,255,70)",
+    plist_bg="rgba(0,0,0,50)", ok="#4ade80", err="#f87171", warn="#fbbf24")
+LIGHT = dict(
+    text="#1b1b2f", muted="rgba(27,27,47,185)", disabled="rgba(27,27,47,80)",
+    card_bg="rgba(255,255,255,165)", card_border="rgba(110,100,190,60)",
+    input_bg="rgba(255,255,255,175)", input_border="rgba(40,40,90,45)",
+    btn_bg="rgba(255,255,255,140)", btn_border="rgba(40,40,90,45)",
+    btn_hover="rgba(255,255,255,215)", btn_press="rgba(255,255,255,100)",
+    popup_bg="#ffffff", popup_border="rgba(40,40,90,50)", dialog_bg="#f1f3fb",
+    check_bg="rgba(255,255,255,210)", check_border="rgba(40,40,90,110)",
+    item_sel="rgba(139,92,246,45)", bar_bg="rgba(40,40,90,35)", scroll="rgba(40,40,90,90)",
+    plist_bg="rgba(255,255,255,140)", ok="#15803d", err="#dc2626", warn="#b45309")
+CUR = {"pal": DARK}                                                       # palette currently in use
+
+QSS_T = """
+* { font-family: 'Segoe UI Variable Text','Segoe UI',sans-serif; font-size: 13px; color: @text@; }
+QDialog { background: @dialog_bg@; }
+QFrame#card { background: @card_bg@; border: 1px solid @card_border@; border-radius: 18px; }
 QLabel { background: transparent; border: none; }
 QLabel#title { font-size: 26px; font-weight: 700; }
-QLabel#muted { color: rgba(242,242,250,150); font-size: 12px; }
-QPlainTextEdit, QLineEdit, QSpinBox { background: rgba(0,0,0,70); border: 1px solid rgba(255,255,255,40);
-    border-radius: 12px; padding: 7px 9px; selection-background-color: #7c6cf0; }
-QComboBox { background: rgba(0,0,0,70); border: 1px solid rgba(255,255,255,40); border-radius: 12px; padding: 7px 12px; }
-QComboBox:disabled, QSpinBox:disabled { color: rgba(242,242,250,70); }
+QLabel#muted { color: @muted@; font-size: 12px; }
+QPlainTextEdit, QLineEdit, QSpinBox { background: @input_bg@; border: 1px solid @input_border@;
+    border-radius: 12px; padding: 7px 9px; selection-background-color: #7c6cf0; selection-color: #ffffff; }
+QComboBox { background: @input_bg@; border: 1px solid @input_border@; border-radius: 12px; padding: 7px 12px; }
+QComboBox:disabled, QSpinBox:disabled { color: @disabled@; }
 QComboBox::drop-down { border: none; width: 22px; }
-QComboBox QAbstractItemView { background: #1d1b30; border: 1px solid rgba(255,255,255,40);
-    selection-background-color: #6d5bd0; outline: 0; }
+QComboBox QAbstractItemView { background: @popup_bg@; border: 1px solid @popup_border@;
+    selection-background-color: #6d5bd0; selection-color: #ffffff; outline: 0; }
 QCheckBox { spacing: 8px; background: transparent; }
 QCheckBox::indicator, QListView::indicator { width: 16px; height: 16px; border-radius: 5px;
-    border: 1px solid rgba(255,255,255,90); background: rgba(0,0,0,70); }
+    border: 1px solid @check_border@; background: @check_bg@; }
 QCheckBox::indicator:checked, QListView::indicator:checked { background: #8b5cf6; border-color: #8b5cf6; }
-QPushButton { background: rgba(255,255,255,24); border: 1px solid rgba(255,255,255,55); border-radius: 12px; padding: 8px 16px; }
-QPushButton:hover { background: rgba(255,255,255,44); }
-QPushButton:pressed { background: rgba(255,255,255,16); }
-QPushButton#accent { border: none; font-weight: 600; padding: 10px 16px;
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #22d3ee, stop:1 #8b5cf6); color: #0b0b18; }
+QPushButton { background: @btn_bg@; border: 1px solid @btn_border@; border-radius: 12px; padding: 8px 16px; }
+QPushButton:hover { background: @btn_hover@; }
+QPushButton:pressed { background: @btn_press@; }
+QPushButton#accent { border: none; font-weight: 600; padding: 10px 16px; color: #0b0b18;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #22d3ee, stop:1 #8b5cf6); }
 QPushButton#accent:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #67e8f9, stop:1 #a78bfa); }
 QListWidget { background: transparent; border: none; outline: 0; }
 QListWidget::item { background: transparent; border-radius: 18px; }
-QListWidget::item:selected { background: rgba(139,92,246,60); }
-QListWidget#plist { background: rgba(0,0,0,50); border: 1px solid rgba(255,255,255,40); border-radius: 12px; }
+QListWidget::item:selected { background: @item_sel@; }
+QListWidget#plist { background: @plist_bg@; border: 1px solid @input_border@; border-radius: 12px; }
 QListWidget#plist::item { border-radius: 8px; padding: 5px; }
-QProgressBar { background: rgba(255,255,255,28); border: none; border-radius: 4px; }
+QProgressBar { background: @bar_bg@; border: none; border-radius: 4px; }
 QProgressBar::chunk { border-radius: 4px;
     background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #22d3ee, stop:1 #a78bfa); }
-QMenu { background: #1d1b30; border: 1px solid rgba(255,255,255,40); padding: 4px; }
+QMenu { background: @popup_bg@; border: 1px solid @popup_border@; padding: 4px; }
 QMenu::item { padding: 6px 20px; border-radius: 6px; }
-QMenu::item:selected { background: #6d5bd0; }
+QMenu::item:selected { background: #6d5bd0; color: #ffffff; }
 QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
-QScrollBar::handle:vertical { background: rgba(255,255,255,70); border-radius: 4px; min-height: 30px; }
+QScrollBar::handle:vertical { background: @scroll@; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 """
 
 
-def enable_blur(hwnd):
+def build_qss(pal):
+    out = QSS_T
+    for k, v in pal.items():
+        out = out.replace(f"@{k}@", v)
+    return out
+
+
+def resolve_theme(pref):
+    """'dark' / 'light' as chosen, or follow Windows when pref is 'system'."""
+    if pref in ("dark", "light"):
+        return pref
+    try:
+        return "light" if QApplication.styleHints().colorScheme() == Qt.ColorScheme.Light else "dark"
+    except Exception:
+        return "dark"
+def resource(rel):
+    """Path to a bundled file, both when run from source and from the PyInstaller exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
+def app_icon():
+    ic = QIcon()
+    for n in (16, 32, 48, 256):
+        p = resource(f"assets/icon-{n}.png")
+        if os.path.exists(p): ic.addFile(p)
+    return ic if not ic.isNull() else QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown)
+
+
+def enable_blur(hwnd, dark=True):
     """Native acrylic blur behind the window. Returns True if applied."""
     if sys.platform != "win32":
         return False
     try:
         dwm = ctypes.windll.dwmapi
-        dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(c_int(1)), 4)        # dark title bar
+        dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(c_int(1 if dark else 0)), 4)   # dark/light title bar
         if sys.getwindowsversion().build >= 22621:                            # Windows 11 22H2+
             dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(c_int(3)), 4)    # acrylic backdrop
 
@@ -74,7 +125,7 @@ def enable_blur(hwnd):
 
         class WCA(Structure):
             _fields_ = [("Attr", c_int), ("Data", c_void_p), ("Size", c_size_t)]
-        acc = ACCENT(4, 2, 0x99201510, 0)
+        acc = ACCENT(4, 2, 0x99201510 if dark else 0x99FCF4F0, 0)   # AABBGGRR tint
         data = WCA(19, ctypes.cast(ctypes.pointer(acc), c_void_p), ctypes.sizeof(acc))
         ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
         return True
@@ -120,7 +171,8 @@ class DownloadCard(Card):
         s.name.setText(t.name if len(t.name) < 70 else t.name[:67] + "...")
         pct = 1.0 if t.status == "Completed" else (min(1.0, t.done / t.size) if t.size else 0)
         s.bar.setValue(int(pct * 1000))
-        col = {"Completed": "#4ade80", "Error": "#f87171", "Paused": "#fbbf24"}.get(t.status, "rgba(242,242,250,150)")
+        pal = CUR["pal"]
+        col = {"Completed": pal["ok"], "Error": pal["err"], "Paused": pal["warn"]}.get(t.status, pal["muted"])
         if col != s._col:
             s._col = col; s.state.setStyleSheet(f"color:{col}; font-size:12px;")
         s.state.setText(t.status)
@@ -148,12 +200,14 @@ class SettingsDialog(QDialog):
         s.cookies.setCurrentText(st["cookies_browser"] or "None")
         s.cookies.setToolTip("Use your logged-in browser session for age-restricted / members-only videos.\n"
                              "Firefox is the most reliable; newer Chrome/Edge versions can fail to share cookies.")
+        s.theme = QComboBox(); s.theme.addItems(["System", "Dark", "Light"])
+        s.theme.setCurrentText(st["theme"].capitalize())
         s.auto = QCheckBox("Keep yt-dlp and Deno up to date automatically"); s.auto.setChecked(st["auto_engine_update"])
         s.clip = QCheckBox("Detect links copied to the clipboard"); s.clip.setChecked(st["clipboard"])
         s.notify = QCheckBox("Show notifications when downloads finish"); s.notify.setChecked(st["notify"])
         f.addRow("Downloads at once", s.maxc); f.addRow("Connections per file", s.conns)
         f.addRow("Speed limit", s.speed); f.addRow("Default folder", fr)
-        f.addRow("Use cookies from", s.cookies); f.addRow("", s.auto); f.addRow("", s.clip); f.addRow("", s.notify)
+        f.addRow("Theme", s.theme); f.addRow("Use cookies from", s.cookies); f.addRow("", s.auto); f.addRow("", s.clip); f.addRow("", s.notify)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(s.accept); bb.rejected.connect(s.reject); f.addRow(bb)
 
@@ -166,7 +220,7 @@ class SettingsDialog(QDialog):
         E.settings.update(max_concurrent=s.maxc.value(), connections=s.conns.value(), speed_kbps=s.speed.value(),
                           folder=s.folder.text().strip() or E.DEFAULT_DIR, cookies_browser="" if c == "None" else c,
                           clipboard=s.clip.isChecked(), notify=s.notify.isChecked(),
-                          auto_engine_update=s.auto.isChecked())
+                          auto_engine_update=s.auto.isChecked(), theme=s.theme.currentText().lower())
         E.save_settings()
 
 
@@ -282,19 +336,22 @@ class Main(QWidget):
         super().__init__()
         s.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         s.setWindowTitle(f"{E.APP_NAME} {E.VERSION}"); s.resize(1020, 720); s.setMinimumSize(780, 560)
-        s.blur = False; s._blurred = False; s.rows = []; s._quitting = False; s._lastclip = ""
+        s.blur = False; s._blurred = False; s.dark = True; s.rows = []; s._quitting = False; s._lastclip = ""
         s.components = []; s._advised = set(); s._app_prompted = False
-        icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown)
+        icon = app_icon()
         s.setWindowIcon(icon)
 
         root = QVBoxLayout(s); root.setContentsMargins(22, 18, 22, 18); root.setSpacing(14)
         head = QHBoxLayout(); head.setSpacing(8)
         t = QLabel(E.APP_NAME); t.setObjectName("title")
         s.status = QLabel("Starting..."); s.status.setObjectName("muted")
+        s.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         s.status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         st = QPushButton("Settings"); st.clicked.connect(s.open_settings)
         s.upd_btn = QPushButton("Updates"); s.upd_btn.clicked.connect(s.open_updates)
-        head.addWidget(t); head.addStretch(1); head.addWidget(s.status); head.addWidget(st); head.addWidget(s.upd_btn)
+        s.theme_btn = QPushButton(); s.theme_btn.setToolTip("Switch between light and dark mode")
+        s.theme_btn.clicked.connect(s.toggle_theme)
+        head.addWidget(t); head.addWidget(s.status, 1); head.addWidget(s.theme_btn); head.addWidget(st); head.addWidget(s.upd_btn)
         root.addLayout(head)
 
         add = Card(); al = QVBoxLayout(add); al.setContentsMargins(16, 14, 16, 14); al.setSpacing(10)
@@ -328,6 +385,13 @@ class Main(QWidget):
         s.list.itemDoubleClicked.connect(s.open_item)
         root.addWidget(s.list, 1)
 
+        credit = QLabel('Made with <span style="color:#f43f5e;">&#10084;&#65039;</span> by '
+                        '<a href="https://github.com/Pabelic1221" style="color:#f43f5e; text-decoration:none;">'
+                        'Jushua Pabelic</a>')
+        credit.setObjectName("muted"); credit.setTextFormat(Qt.TextFormat.RichText)
+        credit.setOpenExternalLinks(True)
+        foot = QHBoxLayout(); foot.addWidget(credit); foot.addStretch(1); root.addLayout(foot)
+
         # tray icon (notifications + keep downloading in background)
         s.tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
         s.tray = QSystemTrayIcon(icon, s)
@@ -348,23 +412,46 @@ class Main(QWidget):
         s.comp_timer = QTimer(s); s.comp_timer.timeout.connect(s.check_components); s.comp_timer.start(12 * 3600 * 1000)
         s.timer = QTimer(s); s.timer.timeout.connect(s.tick); s.timer.start(500)
         s.saver = QTimer(s); s.saver.timeout.connect(s.save); s.saver.start(5000)
+        try:                                                          # follow Windows when Theme = System
+            QApplication.styleHints().colorSchemeChanged.connect(
+                lambda *_: s.apply_theme() if E.settings["theme"] == "system" else None)
+        except Exception:
+            pass
+        s.apply_theme()
 
-    # ---- glass background
+    # ---- theme + glass background
+    def apply_theme(s):
+        s.dark = resolve_theme(E.settings["theme"]) == "dark"
+        CUR["pal"] = DARK if s.dark else LIGHT
+        QApplication.instance().setStyleSheet(build_qss(CUR["pal"]))
+        s.theme_btn.setText("\u2600 Light" if s.dark else "\u263E Dark")      # shows the mode you switch TO
+        if s._blurred:
+            s.blur = enable_blur(int(s.winId()), s.dark)
+        s.update()
+
+    def toggle_theme(s):
+        E.settings["theme"] = "light" if s.dark else "dark"; E.save_settings()
+        s.apply_theme()
+
     def showEvent(s, e):
         super().showEvent(e)
         if not s._blurred:
-            s._blurred = True; s.blur = enable_blur(int(s.winId())); s.update()
+            s._blurred = True; s.blur = enable_blur(int(s.winId()), s.dark); s.update()
 
     def paintEvent(s, e):
         p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        a = 95 if s.blur else 255
+        if s.dark:
+            top, bot, a, glow = QColor(18, 16, 40), QColor(8, 20, 38), 95, ((139, 92, 246, 95), (34, 211, 238, 95))
+        else:
+            top, bot, a, glow = QColor(246, 247, 255), QColor(224, 236, 252), 150, ((167, 139, 250, 80), (103, 232, 249, 90))
+        a = a if s.blur else 255
+        top.setAlpha(a); bot.setAlpha(a)
         g = QLinearGradient(0, 0, s.width(), s.height())
-        g.setColorAt(0, QColor(18, 16, 40, a)); g.setColorAt(1, QColor(8, 20, 38, a))
+        g.setColorAt(0, top); g.setColorAt(1, bot)
         p.fillRect(s.rect(), g)
-        for cx, cy, col in ((0.12, 0.05, QColor(139, 92, 246)), (0.92, 0.95, QColor(34, 211, 238))):
+        for cx, cy, (r_, g_, b_, al) in ((0.12, 0.05, glow[0]), (0.92, 0.95, glow[1])):
             r = QRadialGradient(s.width() * cx, s.height() * cy, max(s.width(), s.height()) * 0.55)
-            c1 = QColor(col); c1.setAlpha(95); c2 = QColor(col); c2.setAlpha(0)
-            r.setColorAt(0, c1); r.setColorAt(1, c2); p.fillRect(s.rect(), r)
+            r.setColorAt(0, QColor(r_, g_, b_, al)); r.setColorAt(1, QColor(r_, g_, b_, 0)); p.fillRect(s.rect(), r)
 
     # ---- adding downloads
     def on_kind(s):
@@ -485,7 +572,7 @@ class Main(QWidget):
     def open_settings(s):
         dlg = SettingsDialog(s)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            dlg.apply(); s.folder.setText(E.settings["folder"])
+            dlg.apply(); s.folder.setText(E.settings["folder"]); s.apply_theme()
 
     def on_clip(s):
         if not E.settings["clipboard"]: return
@@ -566,8 +653,11 @@ class Main(QWidget):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":                                       # own taskbar identity -> shows our icon
+        try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("FlowGet.App")
+        except Exception: pass
     app = QApplication(sys.argv)
+    app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
-    app.setStyleSheet(QSS)
     w = Main(); w.show()
     sys.exit(app.exec())

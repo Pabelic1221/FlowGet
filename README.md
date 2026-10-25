@@ -1,8 +1,14 @@
-# FlowGet
+<p align="center">
+  <img src="assets/logo.svg" alt="FlowGet" width="440">
+</p>
 
 A multi-connection download manager for Windows with a glassmorphism UI. It downloads regular files over parallel connections, and video and audio from sites supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 
 ![build](https://github.com/Pabelic1221/FlowGet/actions/workflows/build.yml/badge.svg)
+
+> Add a screenshot here once you have one: `![FlowGet](docs/screenshot.png)`
+>
+> For a nicer link preview, upload `assets/social-preview.png` under the repo's **Settings, General, Social preview**.
 
 ## Features
 
@@ -18,6 +24,7 @@ A multi-connection download manager for Windows with a glassmorphism UI. It down
 
 **App**
 - Glass UI built with PySide6: native acrylic blur on Windows 10 and 11, with a dark gradient fallback where blur isn't available
+- Light and dark themes: switch with the header button, or choose **System** in Settings to follow Windows
 - Tray icon, completion notifications, clipboard link detection, double-click to open a finished file
 - Settings dialog and a log file for troubleshooting
 
@@ -34,7 +41,7 @@ A multi-connection download manager for Windows with a glassmorphism UI. It down
 ## Run from source
 
 ```powershell
-git clone https://github.com/YOUR_USER/flowget.git
+git clone https://github.com/Pabelic1221/FlowGet.git
 cd flowget
 py -m venv .venv
 .venv\Scripts\Activate.ps1
@@ -52,7 +59,7 @@ build.bat
 
 This produces `dist\FlowGet-Setup.exe` and `dist\FlowGet-Setup.exe.sha256`. The installer is per-user (no admin prompt) and installs to `%LOCALAPPDATA%\Programs\FlowGet`.
 
-For local builds that should check your repo for updates, set `GITHUB_REPO = "YOUR_USER/flowget"` in `engine.py`. Released builds get this stamped in automatically by CI.
+`GITHUB_REPO` in `engine.py` tells the app where to look for updates. Released builds get it stamped in automatically by CI.
 
 ## Release a new version
 
@@ -83,6 +90,7 @@ Both `FlowGet-Setup.exe` and `FlowGet-Setup.exe.sha256` must be on the release. 
 app.py                         UI (PySide6): window, dialogs, tray
 engine.py                      downloads, yt-dlp integration, settings, queue, updates
 installer.iss                  Inno Setup installer script
+assets/                        icon (SVG, PNG, ICO), logo and GitHub social preview
 build.bat                      local build: exe, installer, checksum
 requirements.txt               pinned build dependencies
 .github/workflows/build.yml    CI: test build on PRs, release build on tags

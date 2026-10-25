@@ -3,8 +3,8 @@ import os, sys, re, json, time, threading, subprocess, zipfile, tempfile, shutil
 import urllib.request, urllib.parse
 
 APP_NAME = "FlowGet"
-VERSION = "1.2.0"
-GITHUB_REPO = "Pabelic1221/FlowGet"   # <-- set to your GitHub "user/repo" to enable auto-update
+VERSION = "1.3.0"
+GITHUB_REPO = "Pabelic1221/FlowGet"   # GitHub "user/repo" used for app updates
 
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
 BIN = os.path.join(DATA, "bin")
@@ -35,7 +35,7 @@ tools_ready = threading.Event()
 # ---------------------------------------------------------------- settings
 DEFAULTS = {"max_concurrent": 3, "connections": 8, "speed_kbps": 0, "folder": DEFAULT_DIR,
             "cookies_browser": "", "clipboard": True, "notify": True,
-            "auto_engine_update": True, "tools_checked": 0, "ffmpeg_built": ""}
+            "auto_engine_update": True, "tools_checked": 0, "ffmpeg_built": "", "theme": "dark"}
 settings = dict(DEFAULTS)
 
 
