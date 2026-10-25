@@ -8,10 +8,6 @@
   Download files using parallel connections, or grab video and audio from sites supported by <a href="https://github.com/yt-dlp/yt-dlp">yt-dlp</a>.
 </p>
 
-<p align="center">
-  <img src="https://github.com/Pabelic1221/FlowGet/actions/workflows/build.yml/badge.svg" alt="Build Status">
-</p>
-
 ## Features
 
 **Downloading**
