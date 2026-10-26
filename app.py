@@ -1,12 +1,13 @@
 """FlowGet - glassmorphism UI (PySide6). Download logic lives in engine.py."""
-import os, sys, ctypes, tempfile, subprocess, threading, urllib.parse
+import os, sys, base64, ctypes, tempfile, subprocess, threading, urllib.parse
 from ctypes import c_int, c_uint, c_void_p, c_size_t, Structure, wintypes
-from PySide6.QtCore import Qt, QTimer, Signal, QSize, QPoint, QEvent
-from PySide6.QtGui import QPainter, QLinearGradient, QRadialGradient, QColor, QIcon
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QEvent, QByteArray, QLockFile
+from PySide6.QtGui import (QPainter, QLinearGradient, QRadialGradient, QColor, QIcon, QPixmap, QCursor,
+                           QShortcut, QKeySequence)
 from PySide6.QtWidgets import (QApplication, QWidget, QDialog, QDialogButtonBox, QVBoxLayout, QHBoxLayout,
                                QFormLayout, QGridLayout, QLabel, QPlainTextEdit, QComboBox, QLineEdit, QPushButton,
                                QListWidget, QListWidgetItem, QFileDialog, QMessageBox, QFrame, QProgressBar,
-                               QSpinBox, QCheckBox, QSystemTrayIcon, QMenu, QStyle, QSizePolicy)
+                               QSpinBox, QCheckBox, QSystemTrayIcon, QMenu, QStyle, QSizePolicy, QStackedWidget)
 import engine as E
 
 QUALITY = [("Best", "best"), ("1080p", "1080"), ("720p", "720"), ("480p", "480"), ("360p", "360")]
@@ -22,7 +23,7 @@ DARK = dict(
     popup_bg="#1d1b30", popup_border="rgba(255,255,255,40)", dialog_bg="#17162b",
     check_bg="rgba(0,0,0,70)", check_border="rgba(255,255,255,90)",
     item_sel="rgba(139,92,246,60)", bar_bg="rgba(255,255,255,28)", scroll="rgba(255,255,255,70)",
-    plist_bg="rgba(0,0,0,50)", ok="#4ade80", err="#f87171", warn="#fbbf24")
+    plist_bg="rgba(0,0,0,50)", ok="#4ade80", err="#f87171", warn="#fbbf24", ctl_hover="rgba(255,255,255,35)")
 LIGHT = dict(
     text="#1b1b2f", muted="rgba(27,27,47,185)", disabled="rgba(27,27,47,80)",
     card_bg="rgba(255,255,255,165)", card_border="rgba(110,100,190,60)",
@@ -32,7 +33,7 @@ LIGHT = dict(
     popup_bg="#ffffff", popup_border="rgba(40,40,90,50)", dialog_bg="#f1f3fb",
     check_bg="rgba(255,255,255,210)", check_border="rgba(40,40,90,110)",
     item_sel="rgba(139,92,246,45)", bar_bg="rgba(40,40,90,35)", scroll="rgba(40,40,90,90)",
-    plist_bg="rgba(255,255,255,140)", ok="#15803d", err="#dc2626", warn="#b45309")
+    plist_bg="rgba(255,255,255,140)", ok="#15803d", err="#dc2626", warn="#b45309", ctl_hover="rgba(0,0,0,22)")
 CUR = {"pal": DARK}                                                       # palette currently in use
 
 QSS_T = """
@@ -45,9 +46,11 @@ QPushButton#title:hover { color: #a78bfa; }
 QWidget#titleBar { background: transparent; }
 QLabel#windowTitle { font-size: 12px; font-weight: 600; background: transparent; }
 QPushButton#windowControl { background: transparent; border: none; border-radius: 6px; padding: 0; font-size: 15px; }
-QPushButton#windowControl:hover { background: rgba(255,255,255,35); }
+QPushButton#windowControl:hover { background: @ctl_hover@; }
 QPushButton#closeControl:hover { background: #c42b1c; color: #ffffff; }
 QLabel#muted { color: @muted@; font-size: 12px; }
+QLabel#emptyTitle { font-size: 18px; font-weight: 600; }
+QPushButton#mini { padding: 4px 13px; border-radius: 9px; font-size: 12px; }
 QPlainTextEdit, QLineEdit, QSpinBox { background: @input_bg@; border: 1px solid @input_border@;
     border-radius: 12px; padding: 7px 9px; selection-background-color: #7c6cf0; selection-color: #ffffff; }
 QComboBox { background: @input_bg@; border: 1px solid @input_border@; border-radius: 12px; padding: 7px 12px; }
@@ -97,18 +100,21 @@ def resolve_theme(pref):
         return "light" if QApplication.styleHints().colorScheme() == Qt.ColorScheme.Light else "dark"
     except Exception:
         return "dark"
-def resource(rel):
-    """Path to a bundled file, both when run from source and from the PyInstaller exe."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, rel)
-
-
 def app_icon():
+    """The FlowGet icon, built from icon_data.py (embedded at build time, so no icon folder is needed)."""
     ic = QIcon()
-    for n in (16, 32, 48, 256):
-        p = resource(f"assets/icon-{n}.png")
-        if os.path.exists(p): ic.addFile(p)
+    try:
+        import icon_data
+        for b64 in icon_data.ICONS.values():
+            pm = QPixmap()
+            if pm.loadFromData(base64.b64decode(b64), "PNG"): ic.addPixmap(pm)
+    except Exception:
+        pass
     return ic if not ic.isNull() else QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown)
+
+
+def icon_pixmap(size):
+    return app_icon().pixmap(QSize(size, size))
 
 
 def enable_blur(hwnd, dark=True):
@@ -118,6 +124,8 @@ def enable_blur(hwnd, dark=True):
     try:
         dwm = ctypes.windll.dwmapi
         dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(c_int(1 if dark else 0)), 4)   # dark/light title bar
+        if sys.getwindowsversion().build >= 22000:                            # Windows 11: rounded corners
+            dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(c_int(2)), 4)
         if sys.getwindowsversion().build >= 22621:                            # Windows 11 22H2+
             dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(c_int(3)), 4)    # acrylic backdrop
 
@@ -139,20 +147,19 @@ def enable_blur(hwnd, dark=True):
         return False
 
 
-def discard(path):
-    try:
-        if os.path.exists(path): os.remove(path)
-    except OSError:
-        pass
-
-
 def reveal(path, folder):
+    """Show a file in Explorer (an unfinished download shows its .part file); fall back to the folder."""
     if os.name != "nt":
         return
-    if path and os.path.exists(path):
-        subprocess.Popen(["explorer", "/select," + os.path.normpath(path)])
-    elif os.path.isdir(folder):
+    for cand in (path, (path or "") + ".part"):
+        if cand and os.path.exists(cand):
+            subprocess.Popen(["explorer", "/select," + os.path.normpath(cand)]); return
+    if os.path.isdir(folder):
         os.startfile(folder)
+
+
+RISKY = {".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jse", ".wsf", ".jar", ".scr", ".com",
+         ".lnk", ".hta", ".reg", ".dll", ".cpl", ".msc", ".appx", ".msix"}
 
 
 class Card(QFrame):
@@ -161,33 +168,52 @@ class Card(QFrame):
 
 
 class DownloadCard(Card):
-    def __init__(s):
+    def __init__(s, task, on_open, on_folder):
         super().__init__()
-        s._col = None
-        lay = QVBoxLayout(s); lay.setContentsMargins(16, 12, 16, 12); lay.setSpacing(6)
+        s.task, s.on_open, s.on_folder, s._sig = task, on_open, on_folder, None
+        lay = QVBoxLayout(s); lay.setContentsMargins(16, 12, 16, 10); lay.setSpacing(6)
         row = QHBoxLayout()
         s.name = QLabel(); s.name.setStyleSheet("font-weight:600; font-size:14px;")
         s.state = QLabel(); s.state.setAlignment(Qt.AlignmentFlag.AlignRight)
         row.addWidget(s.name, 1); row.addWidget(s.state)
         s.bar = QProgressBar(); s.bar.setRange(0, 1000); s.bar.setTextVisible(False); s.bar.setFixedHeight(8)
+        bottom = QHBoxLayout(); bottom.setSpacing(6)
         s.meta = QLabel(); s.meta.setObjectName("muted")
-        lay.addLayout(row); lay.addWidget(s.bar); lay.addWidget(s.meta)
+        s.act = QPushButton(); s.act.setObjectName("mini"); s.act.clicked.connect(s.primary)
+        s.fol = QPushButton("Folder"); s.fol.setObjectName("mini")
+        s.fol.setToolTip("Show in folder"); s.fol.clicked.connect(lambda: s.on_folder(s.task))
+        bottom.addWidget(s.meta, 1); bottom.addWidget(s.act); bottom.addWidget(s.fol)
+        lay.addLayout(row); lay.addWidget(s.bar); lay.addLayout(bottom)
+        s.refresh()
 
-    def refresh(s, t):
-        s.name.setText(t.name if len(t.name) < 70 else t.name[:67] + "...")
+    def primary(s):
+        t = s.task
+        if t.status in ("Downloading", "Queued"): t.pause()
+        elif t.status in ("Paused", "Error"): t.resume()
+        elif t.status == "Completed": s.on_open(t)
+
+    def refresh(s):
+        t = s.task; pal = CUR["pal"]
         pct = 1.0 if t.status == "Completed" else (min(1.0, t.done / t.size) if t.size else 0)
-        s.bar.setValue(int(pct * 1000))
-        pal = CUR["pal"]
         col = {"Completed": pal["ok"], "Error": pal["err"], "Paused": pal["warn"]}.get(t.status, pal["muted"])
-        if col != s._col:
-            s._col = col; s.state.setStyleSheet(f"color:{col}; font-size:12px;")
-        s.state.setText(t.status)
         if t.status == "Error" and t.err:
-            s.meta.setText(t.err[:140]); return
-        tag = {"file": "File", "video": "Video", "audio": "Audio"}.get(t.kind, "")
-        spd = f"  •  {E.fmt_size(t.speed)}/s" if t.status == "Downloading" and t.speed else ""
-        size = f"{E.fmt_size(t.done)} / {E.fmt_size(t.size)}" if t.size else E.fmt_size(t.done)
-        s.meta.setText(f"{tag}  •  {int(pct * 100)}%  •  {size}{spd}")
+            meta = t.err[:140]
+        else:
+            tag = {"file": "File", "video": "Video", "audio": "Audio"}.get(t.kind, "")
+            size = f"{E.fmt_size(t.done)} / {E.fmt_size(t.size)}" if t.size else E.fmt_size(t.done)
+            live = t.status == "Downloading" and t.speed > 0
+            meta = f"{tag}  \u2022  {int(pct * 100)}%  \u2022  {size}"
+            if live: meta += f"  \u2022  {E.fmt_size(t.speed)}/s"
+            if live and t.eta(): meta += f"  \u2022  {t.eta()} left"
+        label = {"Paused": "Resume", "Error": "Retry", "Completed": "Open"}.get(t.status, "Pause")
+        name = t.name if len(t.name) < 70 else t.name[:67] + "..."
+        sig = (name, int(pct * 1000), t.status, meta, label, col)
+        if sig == s._sig:
+            return                                                 # nothing changed: skip the repaint
+        s._sig = sig
+        s.name.setText(name); s.bar.setValue(int(pct * 1000))
+        s.state.setStyleSheet(f"color:{col}; font-size:12px;"); s.state.setText(t.status)
+        s.meta.setText(meta); s.act.setText(label)
 
 
 class SettingsDialog(QDialog):
@@ -219,7 +245,7 @@ class SettingsDialog(QDialog):
 
     def browse(s):
         d = QFileDialog.getExistingDirectory(s, "Default folder", s.folder.text())
-        if d: s.folder.setText(d)
+        if d: s.folder.setText(os.path.normpath(d))
 
     def apply(s):
         c = s.cookies.currentText()
@@ -345,6 +371,10 @@ class Main(QWidget):
         if s._frameless:
             s.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         s.setWindowTitle(f"{E.APP_NAME} {E.VERSION}"); s.resize(1020, 720); s.setMinimumSize(780, 560)
+        s.setAcceptDrops(True)
+        if E.settings.get("geometry"):                                # remember window size and position
+            try: s.restoreGeometry(QByteArray.fromBase64(E.settings["geometry"].encode()))
+            except Exception: pass
         s.blur = False; s._blurred = False; s.dark = True; s.rows = []; s._quitting = False; s._lastclip = ""
         s.components = []; s._advised = set(); s._app_prompted = False
         icon = app_icon()
@@ -355,7 +385,8 @@ class Main(QWidget):
             s.titlebar = QWidget(); s.titlebar.setObjectName("titleBar"); s.titlebar.setFixedHeight(38)
             titlebar = QHBoxLayout(s.titlebar); titlebar.setContentsMargins(22, 4, 12, 0); titlebar.setSpacing(4)
             caption = QLabel(f"{E.APP_NAME} {E.VERSION}"); caption.setObjectName("windowTitle")
-            titlebar.addWidget(caption); titlebar.addStretch(1)
+            ico = QLabel(); ico.setPixmap(icon_pixmap(16)); ico.setFixedSize(18, 18)
+            titlebar.addWidget(ico); titlebar.addWidget(caption); titlebar.addStretch(1)
             s.minimize_btn = QPushButton("\u2212"); s.minimize_btn.setObjectName("windowControl")
             s.minimize_btn.setToolTip("Minimize"); s.minimize_btn.setAccessibleName("Minimize window")
             s.minimize_btn.setFixedSize(38, 30); s.minimize_btn.clicked.connect(s.showMinimized)
@@ -369,7 +400,8 @@ class Main(QWidget):
             s.update_window_controls()
         body = QWidget(s)
         content = QVBoxLayout(body); content.setContentsMargins(22, 14, 22, 18); content.setSpacing(14)
-        head = QHBoxLayout(); head.setSpacing(8)
+        head = QHBoxLayout(); head.setSpacing(10)
+        logo = QLabel(); logo.setPixmap(icon_pixmap(40)); logo.setFixedSize(40, 40)
         s.title_toggle = QPushButton(E.APP_NAME); s.title_toggle.setObjectName("title")
         s.title_toggle.setAccessibleName("Toggle light and dark theme")
         s.title_toggle.clicked.connect(s.toggle_theme)
@@ -378,7 +410,7 @@ class Main(QWidget):
         s.status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         st = QPushButton("Settings"); st.clicked.connect(s.open_settings)
         s.upd_btn = QPushButton("Updates"); s.upd_btn.clicked.connect(s.open_updates)
-        head.addWidget(s.title_toggle); head.addWidget(s.status, 1); head.addWidget(st); head.addWidget(s.upd_btn)
+        head.addWidget(logo); head.addWidget(s.title_toggle); head.addWidget(s.status, 1); head.addWidget(st); head.addWidget(s.upd_btn)
         content.addLayout(head)
 
         add = Card(); al = QVBoxLayout(add); al.setContentsMargins(16, 14, 16, 14); al.setSpacing(10)
@@ -402,22 +434,37 @@ class Main(QWidget):
         content.addWidget(add)
 
         bar = QHBoxLayout(); bar.setSpacing(8)
-        for label, fn in (("Pause", s.pause), ("Resume", s.resume), ("Remove", s.remove),
-                          ("Clear completed", s.clear_done), ("Show in folder", s.open_folder)):
-            b = QPushButton(label); b.clicked.connect(fn); bar.addWidget(b)
+        for label, fn, tip in (("Pause", s.pause, "Pause the selected downloads (all of them if none is selected)"),
+                               ("Resume", s.resume, "Resume the selected downloads (all of them if none is selected)"),
+                               ("Remove", s.remove, "Remove the selected downloads (Delete key)"),
+                               ("Clear completed", s.clear_done, "Remove finished downloads from the list"),
+                               ("Show in folder", s.open_folder, "Show the selected download in Explorer")):
+            b = QPushButton(label); b.setToolTip(tip); b.clicked.connect(fn); bar.addWidget(b)
         bar.addStretch(1); content.addLayout(bar)
 
         s.list = QListWidget(); s.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         s.list.setSpacing(6); s.list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         s.list.itemDoubleClicked.connect(s.open_item)
-        content.addWidget(s.list, 1)
+        s.del_key = QShortcut(QKeySequence(Qt.Key.Key_Delete), s.list)
+        s.del_key.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut); s.del_key.activated.connect(s.remove)
+        s.empty = QWidget(); el = QVBoxLayout(s.empty); el.setSpacing(8)
+        el.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        eico = QLabel(); eico.setPixmap(icon_pixmap(96)); eico.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        etitle = QLabel("No downloads yet"); etitle.setObjectName("emptyTitle")
+        etitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ehint = QLabel("Paste links above, drop them onto this window,\nor copy a link and FlowGet will pick it up.")
+        ehint.setObjectName("muted"); ehint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        for w_ in (eico, etitle, ehint): el.addWidget(w_)
+        s.stack = QStackedWidget(); s.stack.addWidget(s.empty); s.stack.addWidget(s.list)
+        content.addWidget(s.stack, 1)
 
         credit = QLabel('Made with <span style="color:#f43f5e;">&#10084;&#65039;</span> by '
                         '<a href="https://github.com/Pabelic1221" style="color:#f43f5e; text-decoration:none;">'
                         'Jushua Pabelic</a>')
         credit.setObjectName("muted"); credit.setTextFormat(Qt.TextFormat.RichText)
         credit.setOpenExternalLinks(True)
-        foot = QHBoxLayout(); foot.addWidget(credit); foot.addStretch(1); content.addLayout(foot)
+        s.stats = QLabel(""); s.stats.setObjectName("muted")
+        foot = QHBoxLayout(); foot.addWidget(credit); foot.addStretch(1); foot.addWidget(s.stats); content.addLayout(foot)
         root.addWidget(body, 1)
 
         # tray icon (notifications + keep downloading in background)
@@ -445,6 +492,7 @@ class Main(QWidget):
                 lambda *_: s.apply_theme() if E.settings["theme"] == "system" else None)
         except Exception:
             pass
+        s.refresh_empty()
         s.apply_theme()
 
     # ---- theme + glass background
@@ -479,27 +527,53 @@ class Main(QWidget):
             s.update_window_controls()
 
     def nativeEvent(s, event_type, message):
-        if s._frameless and event_type == b"windows_generic_MSG":
-            msg = wintypes.MSG.from_address(int(message))
-            if msg.message == 0x0084:                               # WM_NCHITTEST
-                pos = s.mapFromGlobal(QPoint(msg.pt.x, msg.pt.y))
-                if not s.isMaximized():
-                    left, right = pos.x() < 8, pos.x() >= s.width() - 8
-                    top, bottom = pos.y() < 8, pos.y() >= s.height() - 8
-                    if top and left: return True, 13                # HTTOPLEFT
-                    if top and right: return True, 14               # HTTOPRIGHT
-                    if bottom and left: return True, 16             # HTBOTTOMLEFT
-                    if bottom and right: return True, 17            # HTBOTTOMRIGHT
-                    if left: return True, 10                        # HTLEFT
-                    if right: return True, 11                       # HTRIGHT
-                    if top: return True, 12                          # HTTOP
-                    if bottom: return True, 15                       # HTBOTTOM
-                title_pos = s.titlebar.mapFrom(s, pos)
-                if s.titlebar.rect().contains(title_pos):
-                    if not any(b.geometry().contains(title_pos) for b in
-                               (s.minimize_btn, s.maximize_btn, s.close_btn)):
-                        return True, 2                               # HTCAPTION
+        if s._frameless:
+            try:
+                if bytes(event_type) == b"windows_generic_MSG":
+                    msg = wintypes.MSG.from_address(int(message))
+                    if msg.message == 0x0084:                               # WM_NCHITTEST
+                        hit = s._hit_test()
+                        if hit: return True, hit
+            except Exception:
+                pass
         return super().nativeEvent(event_type, message)
+
+    def _hit_test(s):
+        """Resize borders and drag area. Uses Qt's own cursor position, so display scaling (125%, 150%...) is correct."""
+        pos = s.mapFromGlobal(QCursor.pos())
+        if not s.isMaximized():
+            left, right = pos.x() < 8, pos.x() >= s.width() - 8
+            top, bottom = pos.y() < 8, pos.y() >= s.height() - 8
+            if top and left: return 13                                  # HTTOPLEFT
+            if top and right: return 14                                 # HTTOPRIGHT
+            if bottom and left: return 16                               # HTBOTTOMLEFT
+            if bottom and right: return 17                              # HTBOTTOMRIGHT
+            if left: return 10                                          # HTLEFT
+            if right: return 11                                         # HTRIGHT
+            if top: return 12                                           # HTTOP
+            if bottom: return 15                                        # HTBOTTOM
+        title_pos = s.titlebar.mapFrom(s, pos)
+        if s.titlebar.rect().contains(title_pos):
+            if not any(b.geometry().contains(title_pos) for b in (s.minimize_btn, s.maximize_btn, s.close_btn)):
+                return 2                                                # HTCAPTION: drag, double-click maximizes
+        return 0
+
+    # ---- drag & drop of links onto the window
+    def dragEnterEvent(s, e):
+        m = e.mimeData()
+        if m.hasUrls() or m.hasText(): e.acceptProposedAction()
+
+    def dropEvent(s, e):
+        m = e.mimeData(); found = []
+        if m.hasUrls(): found += [u.toString() for u in m.urls() if u.scheme() in ("http", "https")]
+        if m.hasText(): found += [l.strip() for l in m.text().splitlines() if E.valid_url(l.strip())]
+        cur = s.txt.toPlainText().split(); new = []
+        for u in found:
+            if u not in cur and u not in new: new.append(u)
+        if new:
+            s.txt.setPlainText("\n".join(([s.txt.toPlainText().strip()] if s.txt.toPlainText().strip() else []) + new))
+            s.sig_msg.emit(f"{len(new)} link(s) added to the box - press Add downloads")
+        e.acceptProposedAction()
 
     def showEvent(s, e):
         super().showEvent(e)
@@ -530,7 +604,7 @@ class Main(QWidget):
 
     def browse(s):
         d = QFileDialog.getExistingDirectory(s, "Save to", s.folder.text())
-        if d: s.folder.setText(d)
+        if d: s.folder.setText(os.path.normpath(d))
 
     def make_task(s, url, media_only=False):
         k = s.kind.currentText()
@@ -545,18 +619,27 @@ class Main(QWidget):
             kind = "file" if ext in E.FILE_EXTS else "video"
         quality = s.quality.currentData() if kind == "video" else "best"
         fmt = "" if kind == "file" else s.fmt.currentText()
-        return E.Task(url, kind, s.folder.text().strip() or E.DEFAULT_DIR, quality, fmt)
+        return E.Task(url, kind, os.path.normpath(s.folder.text().strip() or E.DEFAULT_DIR), quality, fmt)
 
     def add_urls(s):
-        links = [l.strip() for l in s.txt.toPlainText().splitlines() if l.strip().lower().startswith("http")]
+        lines = [l.strip() for l in s.txt.toPlainText().splitlines() if l.strip()]
+        links = [l for l in lines if E.valid_url(l)]
         if not links:
-            QMessageBox.warning(s, E.APP_NAME, "Paste at least one http(s) link."); return
+            QMessageBox.warning(s, E.APP_NAME, "Paste at least one valid http(s) link."); return
+        folder = os.path.normpath(s.folder.text().strip() or E.DEFAULT_DIR)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(s, E.APP_NAME, f"Can't use that save folder:\n{e}"); return
+        s.folder.setText(folder)
         if s.playlist.isChecked() and s.kind.currentText() != "Direct file":
             s.sig_msg.emit("Reading link...")
             for u in links:
                 threading.Thread(target=s._read_playlist, args=(u,), daemon=True).start()
         else:
             for u in links: s.add_task(s.make_task(u))
+        if len(lines) > len(links):
+            s.sig_msg.emit(f"Skipped {len(lines) - len(links)} line(s) that are not valid http(s) links")
         s.txt.clear()
 
     def _read_playlist(s, url):
@@ -581,58 +664,81 @@ class Main(QWidget):
         s.sig_msg.emit(f"Added {len(chosen)} item(s)")
 
     def add_task(s, task):
-        item = QListWidgetItem(); item.setSizeHint(QSize(0, 100))
-        card = DownloadCard(); card.refresh(task)
+        item = QListWidgetItem(); item.setSizeHint(QSize(0, 112))
+        card = DownloadCard(task, s.open_task, s.reveal_task)
         s.list.addItem(item); s.list.setItemWidget(item, card)
-        s.rows.append((task, item, card))
+        s.rows.append((task, item, card)); s.refresh_empty()
+
+    def refresh_empty(s):
+        s.stack.setCurrentIndex(1 if s.rows else 0)
 
     # ---- list actions
     def selected(s): return [r for r in s.rows if r[1].isSelected()]
 
+    def targets(s):
+        sel = s.selected()
+        return [r[0] for r in (sel or s.rows)]
+
     def pause(s):
-        for t, _, _ in s.selected(): t.pause()
+        for t in s.targets(): t.pause()
 
     def resume(s):
-        for t, _, _ in s.selected():
-            if t.status in ("Paused", "Error"): t.status = "Queued"
+        for t in s.targets(): t.resume()
 
     def _drop(s, r):
         t = r[0]
         t.pause(); s.rows.remove(r); s.list.takeItem(s.list.row(r[1]))
-        if t.kind == "file" and t.status != "Completed" and t.path:   # discard our own partial file
-            QTimer.singleShot(1500, lambda p=t.path: discard(p))
+        E.cleanup_task(t)                                             # delete our own partial file (retries while locked)
 
     def remove(s):
         for r in s.selected(): s._drop(r)
+        s.refresh_empty()
 
     def clear_done(s):
         for r in [r for r in s.rows if r[0].status == "Completed"]:
             s.rows.remove(r); s.list.takeItem(s.list.row(r[1]))
+        s.refresh_empty()
+
+    def reveal_task(s, t): reveal(t.path, t.folder)
 
     def open_folder(s):
-        for t, _, _ in s.selected()[:1]: reveal(t.path, t.folder)
+        for t, _, _ in s.selected()[:1]: s.reveal_task(t)
+
+    def open_task(s, t):
+        if t.status == "Completed" and t.path and os.path.exists(t.path) and os.name == "nt":
+            if os.path.splitext(t.path)[1].lower() in RISKY:
+                ask = QMessageBox.question(s, E.APP_NAME, f"{os.path.basename(t.path)} is a program or script downloaded "
+                                           "from the internet.\n\nOnly run it if you trust the source. Run it now?")
+                if ask != QMessageBox.StandardButton.Yes: return
+            os.startfile(t.path)
+        else:
+            s.reveal_task(t)
 
     def open_item(s, item):
         for t, i, _ in s.rows:
-            if i is item:
-                if t.status == "Completed" and t.path and os.path.exists(t.path) and os.name == "nt":
-                    os.startfile(t.path)
-                else:
-                    reveal(t.path, t.folder)
+            if i is item: s.open_task(t)
 
     def tick(s):
-        cap = int(E.settings["max_concurrent"])
-        running = sum(1 for t, _, _ in s.rows if t.status == "Downloading")
+        cap = E.get_int("max_concurrent", 1, 10)
+        running = sum(1 for t, _, _ in s.rows if t.status == "Downloading" or t.alive())
+        down = queued = 0; total = 0.0
         for t, _, card in s.rows:
-            if t.status == "Queued" and running < cap:
-                t.start(); running += 1
-            if t.kind == "file":
-                t.speed = max(0, (t.done - t.last) / 0.5); t.last = t.done
-            card.refresh(t)
+            if t.status == "Queued" and not t.alive() and running < cap:
+                if t.start(): running += 1
+            if t.status != "Downloading":
+                t.speed = 0.0; t._t = 0.0
+            elif t.kind == "file":
+                t.update_speed()
+            if t.status == "Downloading": down += 1; total += t.speed
+            elif t.status == "Queued": queued += 1
+            card.refresh()
             if t.status == "Completed" and not t.notified:
                 t.notified = True
                 if E.settings["notify"] and s.tray_ok:
                     s.tray.showMessage("Download complete", t.name, QSystemTrayIcon.MessageIcon.Information, 5000)
+        parts = ([f"{down} downloading"] if down else []) + ([f"{queued} queued"] if queued else []) \
+            + ([f"{E.fmt_size(total)}/s"] if total > 0 else [])
+        s.stats.setText("  \u2022  ".join(parts))
 
     def save(s): E.save_queue([r[0] for r in s.rows])
 
@@ -645,7 +751,7 @@ class Main(QWidget):
     def on_clip(s):
         if not E.settings["clipboard"]: return
         txt = QApplication.clipboard().text().strip()
-        if txt.lower().startswith("http") and "\n" not in txt and " " not in txt and txt != s._lastclip:
+        if E.valid_url(txt) and txt != s._lastclip:
             s._lastclip = txt
             cur = s.txt.toPlainText().strip()
             if txt not in cur: s.txt.setPlainText((cur + "\n" if cur else "") + txt)
@@ -707,6 +813,8 @@ class Main(QWidget):
         s._quitting = True
         s.save()                                                      # active items resume on next launch
         for t, _, _ in s.rows: t.pause()
+        try: E.settings["geometry"] = bytes(s.saveGeometry().toBase64()).decode()
+        except Exception: pass
         E.save_settings()
         QApplication.quit()
 
@@ -720,6 +828,18 @@ class Main(QWidget):
             s.quit_app(); e.accept()
 
 
+def install_excepthook(get_window):
+    """Log unexpected errors instead of failing silently, and tell the user."""
+    def hook(et, ev, tb):
+        E.log.error("Unhandled exception", exc_info=(et, ev, tb))
+        w = get_window()
+        if w is not None:
+            try: w.sig_msg.emit(f"Unexpected error: {ev} (details in flowget.log)")
+            except Exception: pass
+    sys.excepthook = hook
+    threading.excepthook = lambda a: hook(a.exc_type, a.exc_value, a.exc_traceback)
+
+
 if __name__ == "__main__":
     if sys.platform == "win32":                                       # own taskbar identity -> shows our icon
         try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("FlowGet.App")
@@ -727,5 +847,14 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
-    w = Main(); w.show()
+    lock = QLockFile(os.path.join(E.DATA, "flowget.lock")); lock.setStaleLockTime(0)
+    if not lock.tryLock(200):                                         # two copies would fight over the same queue
+        ask = QMessageBox.question(None, E.APP_NAME, "FlowGet seems to be running already (check the system tray).\n\n"
+                                   "If it is not, for example after a crash, choose Yes to start anyway.")
+        if ask != QMessageBox.StandardButton.Yes:
+            sys.exit(0)
+        lock.removeStaleLockFile(); lock.tryLock(200)
+    window = None
+    install_excepthook(lambda: window)
+    window = Main(); window.show()
     sys.exit(app.exec())

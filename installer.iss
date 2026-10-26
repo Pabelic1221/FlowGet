@@ -1,5 +1,8 @@
 #define MyAppName "FlowGet"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.4.0"
+#ifndef IconDir
+  #define IconDir "assets"
+#endif
 
 [Setup]
 AppId={{6F1D2C3B-8A47-4E59-B0C2-1A9E5D7F3B42}
@@ -10,7 +13,7 @@ DefaultGroupName={#MyAppName}
 OutputDir=dist
 OutputBaseFilename=FlowGet-Setup
 Compression=lzma
-SetupIconFile=files-logo\icon.ico
+SetupIconFile={#IconDir}\icon.ico
 SolidCompression=yes
 PrivilegesRequired=lowest
 CloseApplications=yes

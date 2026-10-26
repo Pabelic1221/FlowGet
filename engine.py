@@ -3,7 +3,7 @@ import os, sys, re, json, time, threading, subprocess, zipfile, tempfile, shutil
 import urllib.request, urllib.parse
 
 APP_NAME = "FlowGet"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 GITHUB_REPO = "Pabelic1221/FlowGet"   # GitHub "user/repo" used for app updates
 
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
@@ -35,7 +35,7 @@ tools_ready = threading.Event()
 # ---------------------------------------------------------------- settings
 DEFAULTS = {"max_concurrent": 3, "connections": 8, "speed_kbps": 0, "folder": DEFAULT_DIR,
             "cookies_browser": "", "clipboard": True, "notify": True,
-            "auto_engine_update": True, "tools_checked": 0, "ffmpeg_built": "", "theme": "dark"}
+            "auto_engine_update": True, "tools_checked": 0, "ffmpeg_built": "", "theme": "dark", "geometry": ""}
 settings = dict(DEFAULTS)
 
 
@@ -46,12 +46,24 @@ def _write_json(path, obj):
     os.replace(tmp, path)
 
 
-def load_settings():
+def _load_json(path, default):
+    """Read JSON; a corrupt file is kept as <name>.bak instead of being silently lost."""
     try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            settings.update(json.load(f))
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
     except Exception:
-        pass
+        log.exception("corrupt file: %s", path)
+        try: os.replace(path, path + ".bak")
+        except OSError: pass
+        return default
+
+
+def load_settings():
+    d = _load_json(SETTINGS_FILE, {})
+    if isinstance(d, dict):
+        settings.update(d)
 
 
 def save_settings():
@@ -60,6 +72,13 @@ def save_settings():
 
 
 load_settings()
+
+
+def get_int(key, lo, hi):
+    """Settings value as an int clamped to [lo, hi]; bad or tampered values fall back to the default."""
+    try: v = int(settings.get(key, DEFAULTS[key]))
+    except (TypeError, ValueError): v = int(DEFAULTS[key])
+    return max(lo, min(hi, v))
 
 
 def fmt_size(n):
@@ -71,16 +90,36 @@ def fmt_size(n):
     return f"{n:.1f} PB"
 
 
+_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+_path_lock = threading.Lock()
+
+
 def safe_name(n):
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", n).strip(" .")[:180]
+    n = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", n).strip(" .")[:180]
+    if n.split(".")[0].upper() in _RESERVED:                        # CON, NUL, COM1... cannot be file names on Windows
+        n = "_" + n
+    return n
+
+
+def valid_url(u):
+    try: p = urllib.parse.urlparse(u)
+    except ValueError: return False
+    return p.scheme in ("http", "https") and bool(p.netloc) and not re.search(r"\s", u)
 
 
 def unique_path(p):
     base, ext = os.path.splitext(p)
     i = 1
-    while os.path.exists(p):
+    while os.path.exists(p) or os.path.exists(p + ".part"):
         p = f"{base} ({i}){ext}"; i += 1
     return p
+
+
+def fmt_eta(sec):
+    sec = int(sec)
+    if sec < 60: return f"{sec}s"
+    if sec < 3600: return f"{sec // 60}m {sec % 60:02d}s"
+    return f"{sec // 3600}h {(sec % 3600) // 60:02d}m"
 
 
 def fetch(url, dest, cb=None):
@@ -98,20 +137,23 @@ def fetch(url, dest, cb=None):
 
 # ---------------------------------------------------------------- tasks
 PERSIST = ("url", "kind", "folder", "name", "size", "done", "status", "err", "quality", "fmt",
-           "path", "ranged", "segs")
+           "path", "ranged", "segs", "etag")
 
 
 class Task:
     def __init__(s, url, kind, folder, quality="best", fmt=""):
         s.url, s.kind, s.folder, s.quality, s.fmt = url, kind, folder, quality, fmt  # kind: file|video|audio
-        s.name = url[:70]; s.size = 0; s.done = 0; s.speed = 0; s.last = 0
-        s.status = "Queued"; s.err = ""; s.path = None; s.ranged = False; s.segs = None
-        s.stop = threading.Event(); s.lock = threading.Lock(); s.proc = None
-        s.notified = False; s.active = 1
+        s.name = url[:70]; s.size = 0; s.done = 0; s.speed = 0.0; s.last = 0; s._t = 0.0
+        s.status = "Queued"; s.err = ""; s.path = None; s.ranged = False; s.segs = None; s.etag = ""
+        s.stop = threading.Event(); s.lock = threading.Lock(); s.proc = None; s.thread = None
+        s.notified = False; s.want_resume = False; s.fatal = ""
 
     def add(s, n):
         with s.lock:
             s.done += n
+
+    def alive(s):
+        return s.thread is not None and s.thread.is_alive()
 
     def to_dict(s):
         return json.loads(json.dumps({k: getattr(s, k) for k in PERSIST}))
@@ -126,8 +168,11 @@ class Task:
         return t
 
     def start(s):
-        s.stop.clear(); s.status = "Downloading"; s.err = ""
-        threading.Thread(target=s._run, daemon=True).start()
+        if s.alive(): return False                                 # never run two workers on one task
+        s.stop.clear(); s.fatal = ""; s.status = "Downloading"; s.err = ""; s.want_resume = False
+        s.last = s.done; s._t = 0.0; s.speed = 0.0
+        s.thread = threading.Thread(target=s._run, daemon=True); s.thread.start()
+        return True
 
     def _run(s):
         try:
@@ -135,14 +180,46 @@ class Task:
         except Exception as e:
             s.status, s.err = "Error", str(e)[:200]
             log.exception("task failed: %s", s.url)
+        if s.want_resume and s.status == "Paused":                 # Resume was pressed while we were still stopping
+            s.want_resume = False; s.status = "Queued"
 
     def pause(s):
-        s.stop.set()
+        s.want_resume = False; s.stop.set()
         if s.proc:
             try: s.proc.terminate()
             except Exception: pass
         if s.status in ("Downloading", "Queued"):
             s.status = "Paused"
+
+    def resume(s):
+        if s.status in ("Paused", "Error"):
+            s.want_resume = s.alive(); s.status = "Queued"
+
+    def update_speed(s):
+        """Smoothed speed from real elapsed time (file downloads)."""
+        now = time.time()
+        if s._t:
+            inst = max(0.0, (s.done - s.last) / max(now - s._t, 0.001))
+            s.speed = inst if not s.speed else 0.6 * s.speed + 0.4 * inst
+        s._t = now; s.last = s.done
+
+    def eta(s):
+        return fmt_eta((s.size - s.done) / s.speed) if s.size and s.speed > 1 and s.size > s.done else ""
+
+
+def cleanup_task(t):
+    """Delete the partial file of a cancelled file download (retries while Windows still holds it)."""
+    if t.kind != "file" or t.status == "Completed" or not t.path:
+        return
+    part = t.path + ".part"
+    def work():
+        for _ in range(10):
+            try:
+                if os.path.exists(part): os.remove(part)
+                return
+            except OSError:
+                time.sleep(1)
+    threading.Thread(target=work, daemon=True).start()
 
 
 def save_queue(tasks):
@@ -151,14 +228,22 @@ def save_queue(tasks):
 
 
 def load_queue():
-    try:
-        with open(QUEUE_FILE, encoding="utf-8") as f:
-            return [Task.from_dict(d) for d in json.load(f)]
-    except Exception:
-        return []
+    out = []; data = _load_json(QUEUE_FILE, [])
+    for d in data if isinstance(data, list) else []:
+        try: out.append(Task.from_dict(d))
+        except Exception: log.warning("skipped unreadable queue entry")
+    return out
 
 
 # ---------------------------------------------------------------- direct (HTTP) downloads
+class _Fatal(Exception):
+    """Unrecoverable for this download (server stopped supporting resume, or the file changed)."""
+
+
+def part_of(t):
+    return t.path + ".part"
+
+
 def http_probe(t):
     req = urllib.request.Request(t.url, headers={"User-Agent": UA, "Range": "bytes=0-0"})
     with urllib.request.urlopen(req, timeout=30) as r:
@@ -168,6 +253,8 @@ def http_probe(t):
             t.size = int(cr.split("/")[-1]); t.ranged = True
         else:
             t.size = int(r.headers.get("Content-Length", 0)); t.ranged = False
+        et, lm = r.headers.get("ETag", ""), r.headers.get("Last-Modified", "")
+        t.etag = et if et and not et.startswith("W/") else lm         # validator for If-Range
     m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd)
     name = urllib.parse.unquote(m.group(1)) if m else urllib.parse.unquote(
         os.path.basename(urllib.parse.urlparse(final).path))
@@ -181,9 +268,14 @@ def seg_worker(t, g):
             h = {"User-Agent": UA}
             if t.ranged:
                 h["Range"] = f"bytes={g['p']}-{g['e']}"
+                if t.etag: h["If-Range"] = t.etag                   # server answers 200 if the file changed
             t0 = time.time(); sent = 0
             with urllib.request.urlopen(urllib.request.Request(t.url, headers=h), timeout=30) as r, \
-                    open(t.path, "r+b") as f:
+                    open(part_of(t), "r+b") as f:
+                if t.ranged and (r.status != 206 or
+                                 not (r.headers.get("Content-Range") or "").startswith(f"bytes {g['p']}-")):
+                    raise _Fatal("The server stopped supporting resume or the file changed. "
+                                 "Remove this item and add the link again.")
                 f.seek(g["p"])
                 while not t.stop.is_set():
                     b = r.read(65536)
@@ -193,28 +285,63 @@ def seg_worker(t, g):
                             return
                         raise IOError("truncated")
                     f.write(b); g["p"] += len(b); t.add(len(b)); tries = 0
-                    lim = settings["speed_kbps"] * 1024
-                    if lim:                                       # global limit shared across segments
+                    lim = get_int("speed_kbps", 0, 10_000_000) * 1024
+                    if lim:                                       # global limit shared by the unfinished segments
+                        left = sum(1 for x in t.segs if not x["d"]) or 1
                         sent += len(b)
-                        wait = sent / (lim / max(1, t.active)) - (time.time() - t0)
+                        wait = sent / (lim / left) - (time.time() - t0)
                         if wait > 0: time.sleep(min(wait, 1))
+        except _Fatal as e:
+            t.fatal = str(e); t.stop.set(); return
         except Exception as e:
             tries += 1; log.warning("segment retry (%s): %s", tries, e)
+            if not t.ranged:                                      # a fresh stream restarts at byte 0
+                with t.lock:
+                    t.done -= g["p"] - g["s"]; g["p"] = g["s"]
             t.stop.wait(min(2 * tries, 10))
 
 
+def mark_of_the_web(path, url):
+    """Tag a download as coming from the Internet so Windows SmartScreen / Protected View still apply."""
+    if os.name != "nt":
+        return
+    try:
+        p = urllib.parse.urlparse(url)                              # origin only: signed URLs can carry secrets
+        with open(path + ":Zone.Identifier", "w", encoding="ascii", errors="ignore") as f:
+            f.write(f"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={p.scheme}://{p.netloc}/\r\n")
+    except OSError:
+        pass                                                         # e.g. FAT/exFAT drives have no streams
+
+
+def finalize(t):
+    """Move name.part -> name once complete (retries: antivirus may briefly hold the file)."""
+    for i in range(10):
+        try:
+            os.replace(part_of(t), t.path); mark_of_the_web(t.path, t.url); return
+        except OSError:
+            if i == 9: raise
+            time.sleep(0.5)
+
+
 def run_http(t):
-    conns = max(1, int(settings["connections"]))
-    if t.segs and (not t.path or not os.path.exists(t.path)):
-        t.segs = None                                              # file was deleted -> restart
+    conns = get_int("connections", 1, 16)
+    if t.segs:                                                     # resuming: is the partial file still there?
+        if not t.path:
+            t.segs = None
+        elif not os.path.exists(part_of(t)):
+            if os.path.exists(t.path) and not all(g["d"] for g in t.segs):
+                os.replace(t.path, part_of(t))                     # partial file written by an older version
+            else:
+                t.segs = None
     if not t.segs:
         http_probe(t)
         os.makedirs(t.folder, exist_ok=True)
         if t.size and shutil.disk_usage(t.folder).free < t.size + 50 * 1024 * 1024:
             raise RuntimeError("Not enough free disk space")
-        t.path = unique_path(os.path.join(t.folder, t.name)); t.name = os.path.basename(t.path)
-        with open(t.path, "wb") as f:
-            if t.size: f.truncate(t.size)
+        with _path_lock:                                           # two downloads can't pick the same name
+            t.path = unique_path(os.path.join(t.folder, t.name)); t.name = os.path.basename(t.path)
+            with open(part_of(t), "wb") as f:
+                if t.size: f.truncate(t.size)
         if t.ranged and t.size > 2 * 1024 * 1024 and conns > 1:
             step = t.size // conns
             t.segs = [{"s": i * step, "p": i * step, "e": (i + 1) * step - 1 if i < conns - 1 else t.size - 1,
@@ -222,15 +349,17 @@ def run_http(t):
         else:
             t.segs = [{"s": 0, "p": 0, "e": t.size - 1 if t.ranged else -1, "d": False}]
     t.done = sum(g["p"] - g["s"] for g in t.segs)
-    todo = [g for g in t.segs if not g["d"]]
-    t.active = len(todo) or 1
-    ths = [threading.Thread(target=seg_worker, args=(t, g), daemon=True) for g in todo]
+    ths = [threading.Thread(target=seg_worker, args=(t, g), daemon=True) for g in t.segs if not g["d"]]
     for th in ths: th.start()
     for th in ths: th.join()
-    if t.stop.is_set():
+    if t.fatal:                                                    # never keep a possibly corrupt file
+        try: os.remove(part_of(t))
+        except OSError: pass
+        t.segs = None; t.done = 0; t.status, t.err = "Error", t.fatal
+    elif t.stop.is_set():
         t.status = "Paused"
     elif all(g["d"] for g in t.segs):
-        t.status = "Completed"; t.done = t.size or t.done
+        finalize(t); t.status = "Completed"; t.done = t.size or t.done
     else:
         t.status, t.err = "Error", "Connection failed"
 
@@ -253,13 +382,13 @@ def js_args():
 
 def media_cmd(t):
     cmd = [YTDLP, "--newline", "--no-playlist", "--ffmpeg-location", BIN, "-P", t.folder,
-           "-o", "%(title).150s.%(ext)s", "--retries", "10", "--fragment-retries", "10",
+           "-o", "%(title).150s.%(ext)s", "--windows-filenames", "--retries", "10", "--fragment-retries", "10",
            "--concurrent-fragments", "4",
            "--progress-template",
            "download:FG|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
            "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.title)s"]
-    if settings["speed_kbps"]:
-        cmd += ["-r", f"{settings['speed_kbps']}K"]
+    if get_int("speed_kbps", 0, 10_000_000):
+        cmd += ["-r", f"{get_int('speed_kbps', 0, 10_000_000)}K"]
     cmd += cookies_args() + js_args()
     if t.kind == "audio":
         cmd += ["-f", "ba/b", "-x", "--audio-format", t.fmt or "mp3", "--audio-quality", "0"]
@@ -483,7 +612,9 @@ def latest_release():
                                  headers={"User-Agent": UA})
     d = json.load(urllib.request.urlopen(req, timeout=20))
     latest = d["tag_name"].lstrip("v")
-    assets = {a["name"]: a["browser_download_url"] for a in d.get("assets", [])}
+    prefix = f"https://github.com/{GITHUB_REPO}/releases/download/"       # only trust our own release files
+    assets = {a["name"]: a["browser_download_url"] for a in d.get("assets", [])
+              if str(a.get("browser_download_url", "")).startswith(prefix)}
     name = next((n for n in assets if n.endswith("Setup.exe")), None)
     if name and vt(latest) > vt(VERSION):
         return {"version": latest, "url": assets[name], "sha_url": assets.get(name + ".sha256")}

@@ -39,18 +39,28 @@ jobs:
           sub("engine.py", r'^GITHUB_REPO = ".*?"', 'GITHUB_REPO = "' + repo + '"')
           sub("installer.iss", r'^#define MyAppVersion ".*"', '#define MyAppVersion "' + v + '"')
 
+      - name: Embed icons
+        shell: pwsh
+        run: |
+          $dir = (python embed_icons.py | Select-Object -Last 1)
+          if (-not $dir) { throw "No icon folder (files-logo or assets) found" }
+          "ICODIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Engine tests
+        run: python tests/test_engine.py
+
       - name: Smoke test (imports)
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -c "import engine, app; print('imports ok', engine.VERSION)"
+        run: python -c "import engine, app, icon_data; assert icon_data.ICONS; print('imports ok', engine.VERSION)"
 
       - name: Build exe
-        run: python -m PyInstaller --noconfirm --onefile --windowed --name FlowGet app.py
+        run: python -m PyInstaller --noconfirm --onefile --windowed --noupx --name FlowGet --icon "${{ env.ICODIR }}/icon.ico" app.py
 
       - name: Build installer
         run: |
           choco install innosetup -y --no-progress
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DIconDir=$env:ICODIR" installer.iss
 
       - name: Checksum
         shell: pwsh
