@@ -2,13 +2,14 @@
 import os, sys, base64, ctypes, tempfile, subprocess, threading, urllib.parse
 from ctypes import c_int, c_uint, c_void_p, c_size_t, Structure, wintypes
 from PySide6.QtCore import Qt, QTimer, Signal, QSize, QEvent, QByteArray, QLockFile
-from PySide6.QtGui import (QPainter, QLinearGradient, QRadialGradient, QColor, QIcon, QPixmap, QCursor,
+from PySide6.QtGui import (QPainter, QPen, QLinearGradient, QRadialGradient, QColor, QIcon, QPixmap, QCursor,
                            QShortcut, QKeySequence)
 from PySide6.QtWidgets import (QApplication, QWidget, QDialog, QDialogButtonBox, QVBoxLayout, QHBoxLayout,
                                QFormLayout, QGridLayout, QLabel, QPlainTextEdit, QComboBox, QLineEdit, QPushButton,
                                QListWidget, QListWidgetItem, QFileDialog, QMessageBox, QFrame, QProgressBar,
                                QSpinBox, QCheckBox, QSystemTrayIcon, QMenu, QStyle, QSizePolicy, QStackedWidget)
 import engine as E
+import music_playlist as MP
 
 QUALITY = [("Best", "best"), ("1080p", "1080"), ("720p", "720"), ("480p", "480"), ("360p", "360")]
 VFMT = ["mp4", "mkv", "webm"]
@@ -34,7 +35,7 @@ LIGHT = dict(
     check_bg="rgba(255,255,255,210)", check_border="rgba(40,40,90,110)",
     item_sel="rgba(139,92,246,45)", bar_bg="rgba(40,40,90,35)", scroll="rgba(40,40,90,90)",
     plist_bg="rgba(255,255,255,140)", ok="#15803d", err="#dc2626", warn="#b45309", ctl_hover="rgba(0,0,0,22)")
-CUR = {"pal": DARK}                                                       # palette currently in use
+CUR = {"pal": DARK, "theme": None}                                                       # palette currently in use
 
 QSS_T = """
 * { font-family: 'Segoe UI Variable Text','Segoe UI',sans-serif; font-size: 13px; color: @text@; }
@@ -42,7 +43,7 @@ QDialog { background: @dialog_bg@; }
 QFrame#card { background: @card_bg@; border: 1px solid @card_border@; border-radius: 18px; }
 QLabel { background: transparent; border: none; }
 QPushButton#title { font-size: 26px; font-weight: 700; background: transparent; border: none; padding: 0; text-align: left; }
-QPushButton#title:hover { color: #a78bfa; }
+QPushButton#title:hover { color: @a2l@; }
 QWidget#titleBar { background: transparent; }
 QLabel#windowTitle { font-size: 12px; font-weight: 600; background: transparent; }
 QPushButton#windowControl { background: transparent; border: none; border-radius: 6px; padding: 0; font-size: 15px; }
@@ -52,22 +53,22 @@ QLabel#muted { color: @muted@; font-size: 12px; }
 QLabel#emptyTitle { font-size: 18px; font-weight: 600; }
 QPushButton#mini { padding: 4px 13px; border-radius: 9px; font-size: 12px; }
 QPlainTextEdit, QLineEdit, QSpinBox { background: @input_bg@; border: 1px solid @input_border@;
-    border-radius: 12px; padding: 7px 9px; selection-background-color: #7c6cf0; selection-color: #ffffff; }
+    border-radius: 12px; padding: 7px 9px; selection-background-color: @a2@; selection-color: #ffffff; }
 QComboBox { background: @input_bg@; border: 1px solid @input_border@; border-radius: 12px; padding: 7px 12px; }
 QComboBox:disabled, QSpinBox:disabled { color: @disabled@; }
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox QAbstractItemView { background: @popup_bg@; border: 1px solid @popup_border@;
-    selection-background-color: #6d5bd0; selection-color: #ffffff; outline: 0; }
+    selection-background-color: @a2d@; selection-color: #ffffff; outline: 0; }
 QCheckBox { spacing: 8px; background: transparent; }
 QCheckBox::indicator, QListView::indicator { width: 16px; height: 16px; border-radius: 5px;
     border: 1px solid @check_border@; background: @check_bg@; }
-QCheckBox::indicator:checked, QListView::indicator:checked { background: #8b5cf6; border-color: #8b5cf6; }
+QCheckBox::indicator:checked, QListView::indicator:checked { background: @a2@; border-color: @a2@; }
 QPushButton { background: @btn_bg@; border: 1px solid @btn_border@; border-radius: 12px; padding: 8px 16px; }
 QPushButton:hover { background: @btn_hover@; }
 QPushButton:pressed { background: @btn_press@; }
-QPushButton#accent { border: none; font-weight: 600; padding: 10px 16px; color: #0b0b18;
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #22d3ee, stop:1 #8b5cf6); }
-QPushButton#accent:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #67e8f9, stop:1 #a78bfa); }
+QPushButton#accent { border: none; font-weight: 600; padding: 10px 16px; color: @on_accent@;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 @a1@, stop:1 @a2@); }
+QPushButton#accent:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 @a1l@, stop:1 @a2l@); }
 QListWidget { background: transparent; border: none; outline: 0; }
 QListWidget::item { background: transparent; border-radius: 18px; }
 QListWidget::item:selected { background: @item_sel@; }
@@ -75,14 +76,69 @@ QListWidget#plist { background: @plist_bg@; border: 1px solid @input_border@; bo
 QListWidget#plist::item { border-radius: 8px; padding: 5px; }
 QProgressBar { background: @bar_bg@; border: none; border-radius: 4px; }
 QProgressBar::chunk { border-radius: 4px;
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #22d3ee, stop:1 #a78bfa); }
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 @a1@, stop:1 @a2l@); }
 QMenu { background: @popup_bg@; border: 1px solid @popup_border@; padding: 4px; }
 QMenu::item { padding: 6px 20px; border-radius: 6px; }
-QMenu::item:selected { background: #6d5bd0; color: #ffffff; }
+QMenu::item:selected { background: @a2d@; color: #ffffff; }
 QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
 QScrollBar::handle:vertical { background: @scroll@; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 """
+
+
+THEMES = {                       # a1/a2 = accent gradient; dark/light = window background (top, bottom)
+    "Aurora": dict(a1="#22d3ee", a2="#8b5cf6", dark=((18, 16, 40), (8, 20, 38)), light=((246, 247, 255), (224, 236, 252))),
+    "Sunset": dict(a1="#fb923c", a2="#ec4899", dark=((42, 16, 26), (30, 12, 36)), light=((255, 247, 242), (253, 229, 238))),
+    "Ocean":  dict(a1="#38bdf8", a2="#2563eb", dark=((8, 20, 42), (6, 34, 50)), light=((240, 249, 255), (219, 234, 254))),
+    "Forest": dict(a1="#86efac", a2="#059669", dark=((10, 30, 22), (8, 22, 32)), light=((240, 253, 244), (218, 244, 232))),
+    "Sakura": dict(a1="#f9a8d4", a2="#c084fc", dark=((40, 16, 36), (26, 14, 42)), light=((255, 245, 251), (246, 232, 255))),
+    "Ember":  dict(a1="#fde047", a2="#ef4444", dark=((38, 18, 12), (28, 12, 16)), light=((255, 250, 235), (254, 232, 226))),
+    "Mono":   dict(a1="#e5e7eb", a2="#9ca3af", dark=((24, 24, 26), (12, 12, 14)), light=((248, 248, 249), (228, 228, 232))),
+}
+GLASS = ["Solid", "Frosted", "Light glass", "Tinted glass"]    # Solid > Frosted (blurred) > see-through levels
+CLEAR = ("Light glass", "Tinted glass")                          # truly see-through: no blur, desktop shows through
+
+
+def hex_rgb(h):
+    h = h.lstrip("#"); return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def mix_hex(h, other, t):
+    """Blend colour h toward `other` (an (r,g,b) tuple) by t (0..1)."""
+    c = hex_rgb(h)
+    return "#%02x%02x%02x" % tuple(round(c[i] + (other[i] - c[i]) * t) for i in range(3))
+
+
+def swatch_icon(name, size=18):
+    """Round sample of a theme: its accent gradient with a window-background ring."""
+    th = THEMES[name]; pm = QPixmap(size, size); pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    bg = th["dark"][0]
+    p.setPen(QPen(QColor(255, 255, 255, 120), 1)); p.setBrush(QColor(*bg))
+    p.drawEllipse(1, 1, size - 2, size - 2)
+    g = QLinearGradient(0, 0, size, size); g.setColorAt(0, QColor(*hex_rgb(th["a1"]))); g.setColorAt(1, QColor(*hex_rgb(th["a2"])))
+    p.setPen(Qt.PenStyle.NoPen); p.setBrush(g); p.drawEllipse(4, 4, size - 8, size - 8)
+    p.end()
+    return QIcon(pm)
+
+
+def make_palette(dark, style, glass):
+    th = THEMES.get(style, THEMES["Aurora"]); pal = dict(DARK if dark else LIGHT)
+    r, g, b = hex_rgb(th["a2"]); top = th["dark" if dark else "light"][0]
+    lum = sum(0.299 * x + 0.587 * y + 0.114 * z for x, y, z in (hex_rgb(th["a1"]), hex_rgb(th["a2"]))) / 510
+    pal.update(a1=th["a1"], a2=th["a2"], a1l=mix_hex(th["a1"], (255, 255, 255), 0.35),
+               a2l=mix_hex(th["a2"], (255, 255, 255), 0.30), a2d=mix_hex(th["a2"], (0, 0, 0), 0.15),
+               on_accent="#0b0b18" if lum > 0.5 else "#ffffff",
+               item_sel=f"rgba({r},{g},{b},{60 if dark else 45})",
+               dialog_bg="#%02x%02x%02x" % top, popup_bg="#%02x%02x%02x" % top)
+    if glass in CLEAR:                                            # glass panes: keep text readable over any wallpaper
+        if dark:
+            pal.update(card_bg="rgba(10,10,24,%d)" % (70 if glass == "Light glass" else 105), card_border="rgba(255,255,255,80)",
+                       input_bg="rgba(0,0,0,95)", btn_bg="rgba(255,255,255,28)", plist_bg="rgba(0,0,0,80)")
+        else:
+            pal.update(card_bg="rgba(255,255,255,%d)" % (120 if glass == "Light glass" else 150), card_border="rgba(255,255,255,210)",
+                       input_bg="rgba(255,255,255,175)", btn_bg="rgba(255,255,255,120)", plist_bg="rgba(255,255,255,130)")
+    return pal
 
 
 def build_qss(pal):
@@ -117,7 +173,7 @@ def icon_pixmap(size):
     return app_icon().pixmap(QSize(size, size))
 
 
-def enable_blur(hwnd, dark=True):
+def enable_blur(hwnd, dark=True, tint=None, blur=True):
     """Native acrylic blur behind the window. Returns True if applied."""
     if sys.platform != "win32":
         return False
@@ -127,11 +183,12 @@ def enable_blur(hwnd, dark=True):
         if sys.getwindowsversion().build >= 22000:                            # Windows 11: rounded corners
             dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(c_int(2)), 4)
         if sys.getwindowsversion().build >= 22621:                            # Windows 11 22H2+
-            dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(c_int(3)), 4)    # acrylic backdrop
+            dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(c_int(3 if blur else 1)), 4)   # acrylic / none
 
             class MARGINS(Structure):
                 _fields_ = [(n, c_int) for n in ("l", "r", "t", "b")]
-            dwm.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(MARGINS(-1, -1, -1, -1)))
+            m = -1 if blur else 0                                     # clear glass: no frame extension, no blur
+            dwm.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(MARGINS(m, m, m, m)))
             return True
 
         class ACCENT(Structure):                                              # Windows 10 / early 11
@@ -139,7 +196,9 @@ def enable_blur(hwnd, dark=True):
 
         class WCA(Structure):
             _fields_ = [("Attr", c_int), ("Data", c_void_p), ("Size", c_size_t)]
-        acc = ACCENT(4, 2, 0x99201510 if dark else 0x99FCF4F0, 0)   # AABBGGRR tint
+        col = 0x99201510 if dark else 0x99FCF4F0
+        if tint: col = (tint[3] << 24) | (tint[2] << 16) | (tint[1] << 8) | tint[0]
+        acc = ACCENT(4 if blur else 0, 2, col, 0)                                  # AABBGGRR tint
         data = WCA(19, ctypes.cast(ctypes.pointer(acc), c_void_p), ctypes.sizeof(acc))
         ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
         return True
@@ -234,12 +293,15 @@ class SettingsDialog(QDialog):
                              "Firefox is the most reliable; newer Chrome/Edge versions can fail to share cookies.")
         s.theme = QComboBox(); s.theme.addItems(["System", "Dark", "Light"])
         s.theme.setCurrentText(st["theme"].capitalize())
+        s.style_box = QComboBox(); s.style_box.addItems(list(THEMES)); s.style_box.setCurrentText(st.get("style", "Aurora"))
+        s.glass = QComboBox(); s.glass.addItems(GLASS); s.glass.setCurrentText(st.get("glass", "Frosted"))
         s.auto = QCheckBox("Keep yt-dlp and Deno up to date automatically"); s.auto.setChecked(st["auto_engine_update"])
         s.clip = QCheckBox("Detect links copied to the clipboard"); s.clip.setChecked(st["clipboard"])
         s.notify = QCheckBox("Show notifications when downloads finish"); s.notify.setChecked(st["notify"])
         f.addRow("Downloads at once", s.maxc); f.addRow("Connections per file", s.conns)
         f.addRow("Speed limit", s.speed); f.addRow("Default folder", fr)
-        f.addRow("Theme", s.theme); f.addRow("Use cookies from", s.cookies); f.addRow("", s.auto); f.addRow("", s.clip); f.addRow("", s.notify)
+        f.addRow("Mode", s.theme); f.addRow("Style", s.style_box); f.addRow("Glass", s.glass)
+        f.addRow("Use cookies from", s.cookies); f.addRow("", s.auto); f.addRow("", s.clip); f.addRow("", s.notify)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(s.accept); bb.rejected.connect(s.reject); f.addRow(bb)
 
@@ -252,7 +314,8 @@ class SettingsDialog(QDialog):
         E.settings.update(max_concurrent=s.maxc.value(), connections=s.conns.value(), speed_kbps=s.speed.value(),
                           folder=s.folder.text().strip() or E.DEFAULT_DIR, cookies_browser="" if c == "None" else c,
                           clipboard=s.clip.isChecked(), notify=s.notify.isChecked(),
-                          auto_engine_update=s.auto.isChecked(), theme=s.theme.currentText().lower())
+                          auto_engine_update=s.auto.isChecked(), theme=s.theme.currentText().lower(),
+                          style=s.style_box.currentText(), glass=s.glass.currentText())
         E.save_settings()
 
 
@@ -362,6 +425,7 @@ class Main(QWidget):
     sig_msg = Signal(str)
     sig_components = Signal(list)
     sig_playlist = Signal(str, list)
+    sig_music = Signal(str, list)
     sig_quit = Signal()
 
     def __init__(s):
@@ -408,9 +472,10 @@ class Main(QWidget):
         s.status = QLabel("Starting..."); s.status.setObjectName("muted")
         s.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         s.status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        s.theme_btn = QPushButton("Theme"); s.theme_btn.clicked.connect(s.open_theme_menu)
         st = QPushButton("Settings"); st.clicked.connect(s.open_settings)
         s.upd_btn = QPushButton("Updates"); s.upd_btn.clicked.connect(s.open_updates)
-        head.addWidget(logo); head.addWidget(s.title_toggle); head.addWidget(s.status, 1); head.addWidget(st); head.addWidget(s.upd_btn)
+        head.addWidget(logo); head.addWidget(s.title_toggle); head.addWidget(s.status, 1); head.addWidget(s.theme_btn); head.addWidget(st); head.addWidget(s.upd_btn)
         content.addLayout(head)
 
         add = Card(); al = QVBoxLayout(add); al.setContentsMargins(16, 14, 16, 14); al.setSpacing(10)
@@ -477,7 +542,7 @@ class Main(QWidget):
         if s.tray_ok: s.tray.show()
 
         s.sig_msg.connect(s.status.setText); s.sig_components.connect(s.on_components)
-        s.sig_playlist.connect(s.on_playlist); s.sig_quit.connect(s.quit_app)
+        s.sig_playlist.connect(s.on_playlist); s.sig_music.connect(s.on_music); s.sig_quit.connect(s.quit_app)
         QApplication.clipboard().dataChanged.connect(s.on_clip)
 
         for task in E.load_queue():                                   # restore previous session
@@ -498,12 +563,36 @@ class Main(QWidget):
     # ---- theme + glass background
     def apply_theme(s):
         s.dark = resolve_theme(E.settings["theme"]) == "dark"
-        CUR["pal"] = DARK if s.dark else LIGHT
+        style = E.settings.get("style", "Aurora"); style = style if style in THEMES else "Aurora"
+        s.glass = E.settings.get("glass", "Frosted"); s.glass = s.glass if s.glass in GLASS else "Frosted"
+        CUR["pal"] = make_palette(s.dark, style, s.glass); CUR["theme"] = THEMES[style]
         QApplication.instance().setStyleSheet(build_qss(CUR["pal"]))
         s.title_toggle.setToolTip("Click to switch to light mode" if s.dark else "Click to switch to dark mode")
         if s._blurred:
-            s.blur = enable_blur(int(s.winId()), s.dark)
+            s.apply_blur()
         s.update()
+
+    def apply_blur(s):
+        top = CUR["theme"]["dark" if s.dark else "light"][0]
+        alpha = 255 if s.glass == "Solid" else 0x99
+        s.blur = enable_blur(int(s.winId()), s.dark, (*top, alpha), blur=s.glass not in CLEAR)
+
+    def open_theme_menu(s):
+        m = QMenu(s)
+        def add(menu, label, key, value, current):
+            a = menu.addAction(label); a.setCheckable(True); a.setChecked(current == value)
+            if key == "style": a.setIcon(swatch_icon(value))
+            a.triggered.connect(lambda _=False, k=key, v=value: s.set_look(k, v))
+        for title, key, opts, cur in (
+                ("Mode", "theme", (("System", "system"), ("Dark", "dark"), ("Light", "light")), E.settings["theme"]),
+                ("Glass", "glass", tuple((g, g) for g in GLASS), E.settings.get("glass", "Frosted")),
+                ("Style", "style", tuple((n, n) for n in THEMES), E.settings.get("style", "Aurora"))):
+            sub = m.addMenu(title)
+            for label, val in opts: add(sub, label, key, val, cur)
+        m.exec(s.theme_btn.mapToGlobal(s.theme_btn.rect().bottomLeft()))
+
+    def set_look(s, key, value):
+        E.settings[key] = value; E.save_settings(); s.apply_theme()
 
     def toggle_theme(s):
         E.settings["theme"] = "light" if s.dark else "dark"; E.save_settings()
@@ -578,22 +667,35 @@ class Main(QWidget):
     def showEvent(s, e):
         super().showEvent(e)
         if not s._blurred:
-            s._blurred = True; s.blur = enable_blur(int(s.winId()), s.dark); s.update()
+            s._blurred = True; s.apply_blur(); s.update()
 
     def paintEvent(s, e):
         p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if s.dark:
-            top, bot, a, glow = QColor(18, 16, 40), QColor(8, 20, 38), 95, ((139, 92, 246, 95), (34, 211, 238, 95))
-        else:
-            top, bot, a, glow = QColor(246, 247, 255), QColor(224, 236, 252), 150, ((167, 139, 250, 80), (103, 232, 249, 90))
-        a = a if s.blur else 255
-        top.setAlpha(a); bot.setAlpha(a)
+        th = CUR["theme"]; (t, b) = th["dark" if s.dark else "light"]
+        clear = s.glass in CLEAR and s.blur
+        if s.glass == "Solid" or not s.blur: a = 255
+        elif s.glass == "Light glass": a = 38 if s.dark else 60          # nearly clear window glass
+        elif s.glass == "Tinted glass": a = 100 if s.dark else 120       # darker / more colour, still see-through
+        else: a = 95 if s.dark else 150                                  # frosted (blurred)
+        top, bot = QColor(*t, a), QColor(*b, a)
         g = QLinearGradient(0, 0, s.width(), s.height())
         g.setColorAt(0, top); g.setColorAt(1, bot)
         p.fillRect(s.rect(), g)
-        for cx, cy, (r_, g_, b_, al) in ((0.12, 0.05, glow[0]), (0.92, 0.95, glow[1])):
+        ga = (75 if s.glass == "Light glass" else 120) if clear else (95 if s.dark else 80)
+        for cx, cy, col in ((0.12, 0.05, th["a2"]), (0.92, 0.95, th["a1"])):
+            r_, g_, b_ = hex_rgb(col)
             r = QRadialGradient(s.width() * cx, s.height() * cy, max(s.width(), s.height()) * 0.55)
-            r.setColorAt(0, QColor(r_, g_, b_, al)); r.setColorAt(1, QColor(r_, g_, b_, 0)); p.fillRect(s.rect(), r)
+            r.setColorAt(0, QColor(r_, g_, b_, ga)); r.setColorAt(1, QColor(r_, g_, b_, 0)); p.fillRect(s.rect(), r)
+        if clear:                                                 # glass look: colour tint, top sheen, bright edge
+            tint_a = 22 if s.glass == "Light glass" else 70
+            wash = QLinearGradient(0, 0, s.width(), s.height())
+            wash.setColorAt(0, QColor(*hex_rgb(th["a2"]), tint_a)); wash.setColorAt(1, QColor(*hex_rgb(th["a1"]), tint_a))
+            p.fillRect(s.rect(), wash)
+            sheen = QLinearGradient(0, 0, 0, s.height() * 0.4)
+            sheen.setColorAt(0, QColor(255, 255, 255, 40 if s.dark else 80)); sheen.setColorAt(1, QColor(255, 255, 255, 0))
+            p.fillRect(s.rect(), sheen)
+            p.setPen(QPen(QColor(255, 255, 255, 90 if s.dark else 180), 1))
+            p.drawRect(s.rect().adjusted(0, 0, -1, -1))
 
     # ---- adding downloads
     def on_kind(s):
@@ -632,7 +734,15 @@ class Main(QWidget):
         except OSError as e:
             QMessageBox.warning(s, E.APP_NAME, f"Can't use that save folder:\n{e}"); return
         s.folder.setText(folder)
-        if s.playlist.isChecked() and s.kind.currentText() != "Direct file":
+        music = [l for l in links if MP.is_music_link(l)]             # Spotify / Apple Music playlists
+        if music:
+            links = [l for l in links if l not in music]
+            s.sig_msg.emit("Reading playlist...")
+            for u in music:
+                threading.Thread(target=s._read_music, args=(u,), daemon=True).start()
+        if not links:
+            pass
+        elif s.playlist.isChecked() and s.kind.currentText() != "Direct file":
             s.sig_msg.emit("Reading link...")
             for u in links:
                 threading.Thread(target=s._read_playlist, args=(u,), daemon=True).start()
@@ -648,6 +758,25 @@ class Main(QWidget):
             s.sig_playlist.emit(title, items)
         except Exception as e:
             s.sig_msg.emit(f"Could not read link: {e}")
+
+    def _read_music(s, url):
+        try:
+            title, items = MP.fetch_music_playlist(url)
+            s.sig_music.emit(title, items)
+        except Exception as e:
+            s.sig_msg.emit(f"Could not read playlist: {e}")
+
+    def on_music(s, title, items):
+        base = os.path.normpath(s.folder.text().strip() or E.DEFAULT_DIR)
+        dest = os.path.join(base, title)                              # folder named after the playlist
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as e:
+            s.sig_msg.emit(f"Can't create playlist folder: {e}"); return
+        fmt = s.fmt.currentText() if s.kind.currentText() == "Audio" else "mp3"
+        for name, query in items:
+            task = E.Task(query, "audio", dest, "best", fmt); task.name = name; s.add_task(task)
+        s.sig_msg.emit(f"Added {len(items)} track(s) to '{title}'")
 
     def on_playlist(s, title, items):
         if not items:

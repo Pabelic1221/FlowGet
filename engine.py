@@ -380,9 +380,16 @@ def js_args():
     return ["--js-runtimes", f"deno:{DENO}"] if os.path.exists(DENO) else []
 
 
+def is_search(t):
+    return t.url.startswith("ytsearch1:")                         # Spotify / Apple Music track lookups
+
+
 def media_cmd(t):
+    out_tpl = "%(title).150s.%(ext)s"
+    if is_search(t):                                              # name the file "Artist - Title"
+        out_tpl = safe_name(t.url[len("ytsearch1:"):]).replace("%", "%%") + ".%(ext)s"
     cmd = [YTDLP, "--newline", "--no-playlist", "--ffmpeg-location", BIN, "-P", t.folder,
-           "-o", "%(title).150s.%(ext)s", "--windows-filenames", "--retries", "10", "--fragment-retries", "10",
+           "-o", out_tpl, "--windows-filenames", "--retries", "10", "--fragment-retries", "10",
            "--concurrent-fragments", "4",
            "--progress-template",
            "download:FG|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
@@ -419,7 +426,7 @@ def run_media(t):
             d, tot, sp, title = int(num(p[0])), int(num(p[1]) or num(p[2])), num(p[3]), p[4]
             cur_d = d
             t.done = base + d; t.size = base + tot; t.speed = sp
-            if title and title != "NA": t.name = title
+            if title and title != "NA" and not is_search(t): t.name = title
             continue
         if line:
             log.info("yt-dlp: %s", line[:300])
