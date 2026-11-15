@@ -82,7 +82,7 @@ res.append(ok(f"5 quick Pause+Resume -> one worker set, file intact (peak connec
 
 # 6) same filename started simultaneously
 a = E.Task(f"{B}/ok.bin?x=1", "file", os.path.join(OUT, "6")); b = E.Task(f"{B}/ok.bin?x=2", "file", os.path.join(OUT, "6")); a.start(); b.start(); drive(a); drive(b)
-names = sorted(os.listdir(os.path.join(OUT, "6"))); res.append(ok(f"6 same-name downloads get distinct files {names}", a.status == b.status == "Completed" and a.path != b.path and all(sha(p) == WANT for p in (a.path, b.path))))
+names = sorted(os.listdir(os.path.join(OUT, "6"))); res.append(ok(f"6 same-name downloads get distinct files {names}", a.status == b.status == "Completed" and a.path != b.path and all(sha(p) == WANT for p in (a.path, b.path)) and names == ["ok (2).bin", "ok.bin"]))
 
 # 7) names + URLs
 res.append(ok("7 reserved/odd names", E.safe_name("CON.txt") == "_CON.txt" and E.safe_name("a/b:c?.zip") == "a_b_c_.zip" and E.safe_name("..") == "" and E.safe_name("nul") == "_nul"))
@@ -104,10 +104,42 @@ E.urllib.request.urlopen = fake({"tag_name": "v9.0.0", "assets": [{"name": "Flow
 r2 = E.latest_release(); E.urllib.request.urlopen = real
 res.append(ok("9 foreign download URLs ignored, own-repo URLs accepted", r1 is None and r2 and r2["sha_url"].endswith(".sha256")))
 
+E.urllib.request.urlopen = fake([
+    {"tag_name": "Flowgetters", "assets": [{"name": "FlowGet-Setup.exe", "browser_download_url": pre + "FlowGet-Setup.exe"}]},      # not a version
+    {"tag_name": "v9.5.0", "assets": []},                                                                                          # no installer attached
+    {"tag_name": "v9.4.0", "prerelease": True, "assets": [{"name": "FlowGet-Setup.exe", "browser_download_url": pre + "FlowGet-Setup.exe"}]},
+    {"tag_name": "v9.1.0", "assets": [{"name": "FlowGet-Setup.exe", "browser_download_url": pre + "FlowGet-Setup.exe"}, {"name": "FlowGet-Setup.exe.sha256", "browser_download_url": pre + "FlowGet-Setup.exe.sha256"}]},
+    {"tag_name": "v9.0.0", "assets": [{"name": "FlowGet-Setup.exe", "browser_download_url": pre + "FlowGet-Setup.exe"}]}])
+r3 = E.latest_release(); E.urllib.request.urlopen = fake([]); r4 = E.latest_release(); E.urllib.request.urlopen = real
+res.append(ok("9b release list: skips odd tags / pre-releases / no-installer, picks highest valid; empty list -> None", r3 and r3["version"] == "9.1.0" and r3["sha_url"] and r4 is None))
+
 # 10) tampered settings / helpers
 E.settings.update(connections="lots", speed_kbps=-5, max_concurrent=999)
 res.append(ok("10 tampered settings are clamped", E.get_int("connections", 1, 16) == 8 and E.get_int("speed_kbps", 0, 10**7) == 0 and E.get_int("max_concurrent", 1, 10) == 10))
 res.append(ok("10b ETA formatting", [E.fmt_eta(x) for x in (5, 125, 3725)] == ["5s", "2m 05s", "1h 02m"]))
+
+# 11) media (yt-dlp) downloads: an existing file is never skipped/overwritten -> "name (2).ext", "name (3).ext"; no leftovers
+FAKE = os.path.join(TMP, "fake_ytdlp.py")
+open(FAKE, "w").write("""import sys, os, time
+a = sys.argv[1:]
+if "-J" in a: print('{"entries": []}'); sys.exit(0)
+d = a[a.index("-P") + 1]; os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "Fake Title.mp4"); open(p, "wb").write(b"x" * 1000); time.sleep(0.2)
+print("[download] Destination: " + p, flush=True)
+""")
+if os.name == "nt":
+    E.YTDLP = os.path.join(TMP, "fake_ytdlp.cmd"); open(E.YTDLP, "w").write('@"%s" "%s" %%*\r\n' % (sys.executable, FAKE))
+else:
+    E.YTDLP = os.path.join(TMP, "fake_ytdlp.sh"); open(E.YTDLP, "w").write('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, FAKE)); os.chmod(E.YTDLP, 0o755)
+E.tools_ready.set(); M = os.path.join(OUT, "11"); os.makedirs(M)
+open(os.path.join(M, "Fake Title.mp4"), "wb").write(b"original")                      # a file with that name already exists
+m1 = E.Task("https://example.com/v1", "video", M); m2 = E.Task("https://example.com/v2", "video", M); m3 = E.Task("https://example.com/v3", "video", M)
+m1.start(); m2.start(); drive(m1); drive(m2); m3.start(); drive(m3)                  # two at once, then one more
+left = sorted(os.listdir(M))
+res.append(ok(f"11 media duplicates become (2),(3),(4); original untouched; no staging left {left}",
+              all(t.status == "Completed" for t in (m1, m2, m3)) and left == ["Fake Title (2).mp4", "Fake Title (3).mp4", "Fake Title (4).mp4", "Fake Title.mp4"]
+              and open(os.path.join(M, "Fake Title.mp4"), "rb").read() == b"original" and len({m1.path, m2.path, m3.path}) == 3
+              and all(os.path.exists(t.path) for t in (m1, m2, m3))))
 print(f"\n{sum(res)}/{len(res)} passed")
 shutil.rmtree(TMP, ignore_errors=True)
 sys.exit(0 if all(res) else 1)

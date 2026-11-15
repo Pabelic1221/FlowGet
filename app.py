@@ -501,6 +501,7 @@ class Main(QWidget):
         bar = QHBoxLayout(); bar.setSpacing(8)
         for label, fn, tip in (("Pause", s.pause, "Pause the selected downloads (all of them if none is selected)"),
                                ("Resume", s.resume, "Resume the selected downloads (all of them if none is selected)"),
+                               ("Retry failed", s.retry_failed, "Retry the failed downloads (the selected ones, or all failed ones if none is selected)"),
                                ("Remove", s.remove, "Remove the selected downloads (Delete key)"),
                                ("Clear completed", s.clear_done, "Remove finished downloads from the list"),
                                ("Show in folder", s.open_folder, "Show the selected download in Explorer")):
@@ -813,6 +814,10 @@ class Main(QWidget):
 
     def resume(s):
         for t in s.targets(): t.resume()
+
+    def retry_failed(s):
+        for t in s.targets():
+            if t.status == "Error": t.resume()
 
     def _drop(s, r):
         t = r[0]

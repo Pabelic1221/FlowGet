@@ -1,6 +1,6 @@
 """FlowGet engine: downloads, yt-dlp integration, settings, queue persistence, updates."""
 import shlex
-import os, sys, re, json, time, threading, subprocess, zipfile, tempfile, shutil, hashlib, logging
+import os, sys, re, json, time, threading, subprocess, zipfile, tempfile, shutil, hashlib, logging, ctypes
 import urllib.request, urllib.parse
 
 APP_NAME = "FlowGet"
@@ -110,7 +110,7 @@ def valid_url(u):
 
 def unique_path(p):
     base, ext = os.path.splitext(p)
-    i = 1
+    i = 2
     while os.path.exists(p) or os.path.exists(p + ".part"):
         p = f"{base} ({i}){ext}"; i += 1
     return p
@@ -138,14 +138,14 @@ def fetch(url, dest, cb=None):
 
 # ---------------------------------------------------------------- tasks
 PERSIST = ("url", "kind", "folder", "name", "size", "done", "status", "err", "quality", "fmt",
-           "path", "ranged", "segs", "etag", "resolved")
+           "path", "ranged", "segs", "etag", "resolved", "stage")
 
 
 class Task:
     def __init__(s, url, kind, folder, quality="best", fmt=""):
         s.url, s.kind, s.folder, s.quality, s.fmt = url, kind, folder, quality, fmt  # kind: file|video|audio
         s.name = url[:70]; s.size = 0; s.done = 0; s.speed = 0.0; s.last = 0; s._t = 0.0
-        s.status = "Queued"; s.err = ""; s.path = None; s.ranged = False; s.segs = None; s.etag = ""; s.resolved = ""
+        s.status = "Queued"; s.err = ""; s.path = None; s.ranged = False; s.segs = None; s.etag = ""; s.resolved = ""; s.stage = ""
         s.stop = threading.Event(); s.lock = threading.Lock(); s.proc = None; s.thread = None
         s.notified = False; s.want_resume = False; s.fatal = ""
 
@@ -209,14 +209,21 @@ class Task:
 
 
 def cleanup_task(t):
-    """Delete the partial file of a cancelled file download (retries while Windows still holds it)."""
-    if t.kind != "file" or t.status == "Completed" or not t.path:
-        return
-    part = t.path + ".part"
+    """Delete the partial data of a cancelled download (retries while Windows still holds it)."""
+    if t.status == "Completed": return
+    if t.kind == "file":
+        if not t.path: return
+        target, is_dir = t.path + ".part", False
+    else:
+        if not t.stage: return
+        target, is_dir = stage_dir(t), True
     def work():
         for _ in range(10):
             try:
-                if os.path.exists(part): os.remove(part)
+                if is_dir: shutil.rmtree(target)
+                elif os.path.exists(target): os.remove(target)
+                return
+            except FileNotFoundError:
                 return
             except OSError:
                 time.sleep(1)
@@ -431,13 +438,32 @@ def resolve_search(t):
     log.info("match for %r (%ss): %r %ss", label, dur, best.get("title"), best.get("duration"))
 
 
+def stage_dir(t):
+    """Private folder where yt-dlp works; finished files are moved out with a unique name (never overwrite/skip)."""
+    return os.path.join(t.folder, ".flowget-" + t.stage)
+
+
+def finalize_media(t):
+    """Move the finished file(s) from the staging folder into t.folder as 'name.ext', 'name (2).ext', 'name (3).ext'..."""
+    stage = stage_dir(t); moved = {}
+    if not os.path.isdir(stage): return
+    with _path_lock:                                               # two downloads can't pick the same name
+        for fn in sorted(os.listdir(stage)):
+            if fn.endswith((".part", ".ytdl", ".temp")) or re.search(r"\.f\d+\.", fn): continue
+            dst = unique_path(os.path.join(t.folder, fn))
+            shutil.move(os.path.join(stage, fn), dst); moved[fn] = dst
+    if t.path and os.path.basename(t.path) in moved: t.path = moved[os.path.basename(t.path)]
+    elif moved: t.path = next(iter(moved.values()))
+    shutil.rmtree(stage, ignore_errors=True)
+
+
 def media_cmd(t, extra=()):
     out_tpl = "%(title).150s.%(ext)s"
     label = ""
     if is_search(t):                                              # name the file "Artist - Title"
         label = parse_search(t.url)[0]
         out_tpl = safe_name(label).replace("%", "%%") + ".%(ext)s"
-    cmd = [YTDLP, "--newline", "--no-playlist", "--ffmpeg-location", BIN, "-P", t.folder,
+    cmd = [YTDLP, "--newline", "--no-playlist", "--ffmpeg-location", BIN, "-P", stage_dir(t),
            "-o", out_tpl, "--windows-filenames", "--retries", "10", "--fragment-retries", "10",
            "--concurrent-fragments", "4",
            "--progress-template",
@@ -471,6 +497,11 @@ def run_media(t, extra=()):
     if is_search(t) and not t.resolved:
         try: resolve_search(t)
         except Exception as ex: log.warning("match search failed (%s), using plain search", ex)   # falls back to ytsearch1
+    if not t.stage: t.stage = os.urandom(4).hex()
+    os.makedirs(stage_dir(t), exist_ok=True)
+    if os.name == "nt":
+        try: ctypes.windll.kernel32.SetFileAttributesW(stage_dir(t), 2)     # hidden
+        except Exception: pass
     cmd = media_cmd(t, extra)
     log.info("yt-dlp: %s", " ".join(cmd[:-1]) + " <url>")
     t.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -502,7 +533,13 @@ def run_media(t, extra=()):
     if t.stop.is_set():
         t.status = "Paused"
     elif rc == 0 or done_already:
-        t.status = "Completed"; t.size = t.size or t.done
+        try:
+            finalize_media(t)
+        except Exception as ex:
+            log.exception("could not move finished file")
+            t.status, t.err = "Error", "Could not save the file: " + str(ex)[:150]
+        else:
+            t.status = "Completed"; t.size = t.size or t.done
     else:
         err = (errline or last)[:200]
         if "403" in err and not extra:                              # site blocked a plain request: retry posing as Chrome
@@ -676,20 +713,27 @@ def vt(v):
 
 
 def latest_release():
-    """Returns {'version','url','sha_url'} if a newer release exists, else None."""
+    """Returns {'version','url','sha_url'} if a newer release exists, else None.
+    Reads the release list and takes the highest version that has a Setup file, so a missing 'Latest' label,
+    a pre-release, a draft or a stray non-version tag can never hide (or fake) an update."""
     if "YOUR_USER" in GITHUB_REPO:
         raise RuntimeError("Set GITHUB_REPO in engine.py first")
-    req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+    req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=30",
                                  headers={"User-Agent": UA})
-    d = json.load(urllib.request.urlopen(req, timeout=20))
-    latest = d["tag_name"].lstrip("v")
+    data = json.load(urllib.request.urlopen(req, timeout=20))
+    if isinstance(data, dict): data = [data]
     prefix = f"https://github.com/{GITHUB_REPO}/releases/download/"       # only trust our own release files
-    assets = {a["name"]: a["browser_download_url"] for a in d.get("assets", [])
-              if str(a.get("browser_download_url", "")).startswith(prefix)}
-    name = next((n for n in assets if n.endswith("Setup.exe")), None)
-    if name and vt(latest) > vt(VERSION):
-        return {"version": latest, "url": assets[name], "sha_url": assets.get(name + ".sha256")}
-    return None
+    best = None
+    for d in data if isinstance(data, list) else []:
+        if not isinstance(d, dict) or d.get("draft") or d.get("prerelease"): continue
+        tag = str(d.get("tag_name", "")).lstrip("vV")
+        if not re.fullmatch(r"\d+(\.\d+)*", tag): continue                  # ignore tags like "Flowgetters"
+        assets = {a["name"]: a["browser_download_url"] for a in d.get("assets", [])
+                  if str(a.get("browser_download_url", "")).startswith(prefix)}
+        name = next((n for n in assets if n.endswith("Setup.exe")), None)
+        if name and (best is None or vt(tag) > vt(best["version"])):
+            best = {"version": tag, "url": assets[name], "sha_url": assets.get(name + ".sha256")}
+    return best if best and vt(best["version"]) > vt(VERSION) else None
 
 
 def download_verified(url, sha_url, dest, cb=None):
