@@ -127,10 +127,9 @@ d = a[a.index("-P") + 1]; os.makedirs(d, exist_ok=True)
 p = os.path.join(d, "Fake Title.mp4"); open(p, "wb").write(b"x" * 1000); time.sleep(0.2)
 print("[download] Destination: " + p, flush=True)
 """)
-if os.name == "nt":
-    E.YTDLP = os.path.join(TMP, "fake_ytdlp.cmd"); open(E.YTDLP, "w").write('@"%s" "%s" %%*\r\n' % (sys.executable, FAKE))
-else:
-    E.YTDLP = os.path.join(TMP, "fake_ytdlp.sh"); open(E.YTDLP, "w").write('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, FAKE)); os.chmod(E.YTDLP, 0o755)
+E.YTDLP = FAKE                                                                       # only has to exist; the command below runs it via Python
+_real_media_cmd = E.media_cmd
+E.media_cmd = lambda t, extra=(): [sys.executable, FAKE] + _real_media_cmd(t, extra)[1:]   # no .cmd/.sh wrapper: works the same on Windows
 E.tools_ready.set(); M = os.path.join(OUT, "11"); os.makedirs(M)
 open(os.path.join(M, "Fake Title.mp4"), "wb").write(b"original")                      # a file with that name already exists
 m1 = E.Task("https://example.com/v1", "video", M); m2 = E.Task("https://example.com/v2", "video", M); m3 = E.Task("https://example.com/v3", "video", M)
