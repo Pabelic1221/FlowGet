@@ -768,7 +768,7 @@ class Main(QWidget):
 
     def on_music(s, title, items):
         base = os.path.normpath(s.folder.text().strip() or E.DEFAULT_DIR)
-        dest = os.path.join(base, title)                              # folder named after the playlist
+        dest = os.path.join(base, E.safe_name(title) or "Playlist")   # folder named after the playlist (title comes from the web: sanitise it)
         try:
             os.makedirs(dest, exist_ok=True)
         except OSError as e:

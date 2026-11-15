@@ -1,4 +1,5 @@
 """FlowGet engine: downloads, yt-dlp integration, settings, queue persistence, updates."""
+import shlex
 import os, sys, re, json, time, threading, subprocess, zipfile, tempfile, shutil, hashlib, logging
 import urllib.request, urllib.parse
 
@@ -137,14 +138,14 @@ def fetch(url, dest, cb=None):
 
 # ---------------------------------------------------------------- tasks
 PERSIST = ("url", "kind", "folder", "name", "size", "done", "status", "err", "quality", "fmt",
-           "path", "ranged", "segs", "etag")
+           "path", "ranged", "segs", "etag", "resolved")
 
 
 class Task:
     def __init__(s, url, kind, folder, quality="best", fmt=""):
         s.url, s.kind, s.folder, s.quality, s.fmt = url, kind, folder, quality, fmt  # kind: file|video|audio
         s.name = url[:70]; s.size = 0; s.done = 0; s.speed = 0.0; s.last = 0; s._t = 0.0
-        s.status = "Queued"; s.err = ""; s.path = None; s.ranged = False; s.segs = None; s.etag = ""
+        s.status = "Queued"; s.err = ""; s.path = None; s.ranged = False; s.segs = None; s.etag = ""; s.resolved = ""
         s.stop = threading.Event(); s.lock = threading.Lock(); s.proc = None; s.thread = None
         s.notified = False; s.want_resume = False; s.fatal = ""
 
@@ -384,10 +385,58 @@ def is_search(t):
     return t.url.startswith("ytsearch1:")                         # Spotify / Apple Music track lookups
 
 
-def media_cmd(t):
+def parse_search(url):
+    """'ytsearch1:Artist - Title ||dur=215' -> ('Artist - Title', 215)"""
+    body, dur = url[len("ytsearch1:"):], 0
+    if " ||dur=" in body:
+        body, _, d = body.rpartition(" ||dur=")
+        dur = int(d) if d.isdigit() else 0
+    return body.strip(), dur
+
+
+_BAD = ("live", "cover", "remix", "karaoke", "instrumental", "slowed", "sped up", "speed up", "reverb", "nightcore",
+        "8d", "reaction", "tutorial", "lesson", "mashup", "acoustic", "bass boosted", "extended", "loop", "1 hour")
+
+
+def pick_best(cands, label, dur):
+    """Choose the YouTube result most likely to be the original track.
+    cands: [{id, title, duration, channel}]. Prefers matching length, official 'Topic' uploads, and avoids
+    live / cover / remix / sped-up versions unless the wanted title itself says so."""
+    want = label.lower(); best, best_score = None, None
+    for i, c in enumerate(cands):
+        title = (c.get("title") or "").lower(); chan = (c.get("channel") or c.get("uploader") or "").lower()
+        if not c.get("id"): continue
+        score = i * 1.5                                           # search rank still counts a little
+        cd = c.get("duration")
+        if dur and cd: score += abs(cd - dur) * (1 if abs(cd - dur) <= 12 else 3)
+        elif dur: score += 40                                     # unknown length: be suspicious
+        if chan.endswith("- topic"): score -= 15                  # official auto-generated audio
+        if "official audio" in title: score -= 8
+        if "lyric" in title: score += 3
+        score += sum(60 for w in _BAD if re.search(rf"\b{re.escape(w)}\b", title) and not re.search(rf"\b{re.escape(w)}\b", want))
+        if best_score is None or score < best_score: best, best_score = c, score
+    return best
+
+
+def resolve_search(t):
+    """Find the exact YouTube video for a Spotify/Apple track (runs once per task, result is saved)."""
+    label, dur = parse_search(t.url)
+    out = subprocess.run([YTDLP, "-J", "--flat-playlist", "--no-warnings"] + cookies_args() + js_args() +
+                         [f"ytsearch8:{label}"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         timeout=90, creationflags=NOWIN)
+    if out.returncode != 0: raise RuntimeError((out.stderr or "search failed").strip().splitlines()[-1][:160])
+    best = pick_best(json.loads(out.stdout).get("entries") or [], label, dur)
+    if not best: raise RuntimeError("No match found on YouTube")
+    t.resolved = best["id"]
+    log.info("match for %r (%ss): %r %ss", label, dur, best.get("title"), best.get("duration"))
+
+
+def media_cmd(t, extra=()):
     out_tpl = "%(title).150s.%(ext)s"
+    label = ""
     if is_search(t):                                              # name the file "Artist - Title"
-        out_tpl = safe_name(t.url[len("ytsearch1:"):]).replace("%", "%%") + ".%(ext)s"
+        label = parse_search(t.url)[0]
+        out_tpl = safe_name(label).replace("%", "%%") + ".%(ext)s"
     cmd = [YTDLP, "--newline", "--no-playlist", "--ffmpeg-location", BIN, "-P", t.folder,
            "-o", out_tpl, "--windows-filenames", "--retries", "10", "--fragment-retries", "10",
            "--concurrent-fragments", "4",
@@ -396,7 +445,7 @@ def media_cmd(t):
            "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.title)s"]
     if get_int("speed_kbps", 0, 10_000_000):
         cmd += ["-r", f"{get_int('speed_kbps', 0, 10_000_000)}K"]
-    cmd += cookies_args() + js_args()
+    cmd += cookies_args() + js_args() + list(extra)
     if t.kind == "audio":
         cmd += ["-f", "ba/b", "-x", "--audio-format", t.fmt or "mp3", "--audio-quality", "0"]
     else:
@@ -406,15 +455,23 @@ def media_cmd(t):
         cmd += ["-f", sel, "--merge-output-format", fmt]
         if fmt == "mp4":
             cmd += ["-S", "ext:mp4:m4a"]                          # prefer MP4-compatible codecs
-    cmd.append(t.url)
+    if label and t.kind == "audio":                               # tag the file with the real artist / title
+        artist, _, title = label.partition(" - ")
+        if title: cmd += ["--postprocessor-args", "ffmpeg:" + " ".join(
+            ["-metadata", shlex.quote("title=" + title), "-metadata", shlex.quote("artist=" + artist)])]
+    cmd.append(f"https://www.youtube.com/watch?v={t.resolved}" if label and t.resolved
+               else ("ytsearch1:" + label if label else t.url))
     return cmd
 
 
-def run_media(t):
+def run_media(t, extra=()):
     tools_ready.wait()
     if not os.path.exists(YTDLP):
         raise RuntimeError("Media engine missing - check your internet connection and restart")
-    cmd = media_cmd(t)
+    if is_search(t) and not t.resolved:
+        try: resolve_search(t)
+        except Exception as ex: log.warning("match search failed (%s), using plain search", ex)   # falls back to ytsearch1
+    cmd = media_cmd(t, extra)
     log.info("yt-dlp: %s", " ".join(cmd[:-1]) + " <url>")
     t.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               encoding="utf-8", errors="replace", creationflags=NOWIN)
@@ -447,7 +504,14 @@ def run_media(t):
     elif rc == 0 or done_already:
         t.status = "Completed"; t.size = t.size or t.done
     else:
-        t.status, t.err = "Error", (errline or last)[:200]
+        err = (errline or last)[:200]
+        if "403" in err and not extra:                              # site blocked a plain request: retry posing as Chrome
+            log.info("yt-dlp: HTTP 403, retrying with browser impersonation")
+            t.done = t.size = 0
+            return run_media(t, ["--impersonate", "chrome"])
+        if extra and "mpersonat" in err:
+            err = "HTTP 403 and browser impersonation is unavailable - update yt-dlp (Updates) or set cookies to Firefox"
+        t.status, t.err = "Error", err
 
 
 def fetch_playlist(url):
