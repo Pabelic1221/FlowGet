@@ -25,6 +25,15 @@ FFMPEG_API = "https://api.github.com/repos/yt-dlp/FFmpeg-Builds/releases/latest"
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FlowGet"
 NOWIN = 0x08000000 if os.name == "nt" else 0
+
+
+def clean_env():
+    """Environment for starting another PyInstaller program (the update installer, which relaunches FlowGet).
+    Without this the new FlowGet inherits our private temp folder (_MEI...), which is deleted when we exit,
+    and fails with 'Failed to load Python DLL'."""
+    env = {k: v for k, v in os.environ.items() if not (k.startswith("_PYI") or k == "_MEIPASS2")}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
 FILE_EXTS = {"zip", "rar", "7z", "exe", "msi", "iso", "pdf", "mp3", "mp4", "mkv", "avi", "mov", "wav",
              "flac", "m4a", "webm", "jpg", "jpeg", "png", "gif", "doc", "docx", "xls", "xlsx", "ppt",
              "pptx", "apk", "dmg", "gz", "tar", "torrent", "txt", "csv", "bin"}

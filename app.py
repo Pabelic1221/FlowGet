@@ -933,7 +933,7 @@ class Main(QWidget):
                 p = os.path.join(tempfile.gettempdir(), "FlowGet-Setup.exe")
                 E.download_verified(info["url"], info["sha_url"], p,
                                     lambda f: s.sig_msg.emit(f"Downloading update: {int(f * 100)}%"))
-                subprocess.Popen([p, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"], creationflags=E.NOWIN)
+                subprocess.Popen([p, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"], creationflags=E.NOWIN, env=E.clean_env())
                 s.sig_quit.emit()
             except Exception as e:
                 s.sig_msg.emit(f"Update failed: {e}")

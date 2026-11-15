@@ -139,6 +139,12 @@ res.append(ok(f"11 media duplicates become (2),(3),(4); original untouched; no s
               all(t.status == "Completed" for t in (m1, m2, m3)) and left == ["Fake Title (2).mp4", "Fake Title (3).mp4", "Fake Title (4).mp4", "Fake Title.mp4"]
               and open(os.path.join(M, "Fake Title.mp4"), "rb").read() == b"original" and len({m1.path, m2.path, m3.path}) == 3
               and all(os.path.exists(t.path) for t in (m1, m2, m3))))
+
+# 12) launching the update installer must not leak PyInstaller's private temp-folder variables to the new FlowGet
+os.environ["_MEIPASS2"] = "C:\\old\\_MEI1"; os.environ["_PYI_APPLICATION_HOME_DIR"] = "C:\\old\\_MEI1"
+env = E.clean_env()
+res.append(ok("12 clean_env strips _PYI*/_MEIPASS2 and sets PYINSTALLER_RESET_ENVIRONMENT", env.get("PYINSTALLER_RESET_ENVIRONMENT") == "1"
+              and not any(k.startswith("_PYI") or k == "_MEIPASS2" for k in env) and "PATH" in env))
 print(f"\n{sum(res)}/{len(res)} passed")
 shutil.rmtree(TMP, ignore_errors=True)
 sys.exit(0 if all(res) else 1)
