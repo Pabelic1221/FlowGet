@@ -35,7 +35,7 @@ log = logging.getLogger("flowget")
 tools_ready = threading.Event()
 
 # ---------------------------------------------------------------- settings
-DEFAULTS = {"max_concurrent": 4, "connections": 16, "speed_kbps": 0, "folder": DEFAULT_DIR, "bind_ips": "", "torrent_upload_kbps": 0,
+DEFAULTS = {"max_concurrent": 4, "connections": 8, "speed_kbps": 0, "folder": DEFAULT_DIR, "bind_ips": "", "torrent_upload_kbps": 0,
             "cookies_browser": "", "clipboard": True, "notify": True,
             "auto_engine_update": True, "tools_checked": 0, "ffmpeg_built": "", "theme": "dark", "geometry": ""}
 settings = dict(DEFAULTS)
