@@ -20,6 +20,9 @@ def safe_folder_name(name, fallback="Playlist"):
     name = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", name or "")      # invisible direction marks
     name = re.sub(r":\s+", " - ", name)                                         # "A: B" -> "A - B"
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    name = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", name or "")      # invisible direction marks
+    name = re.sub(r":\s+", " - ", name)                                         # "A: B" -> "A - B"
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     return name[:100] or fallback
 
 
@@ -36,6 +39,17 @@ def _walk(obj):
         for v in obj.values(): yield from _walk(v)
     elif isinstance(obj, list):
         for v in obj: yield from _walk(v)
+
+
+def _secs(v, div=1):
+    try: return int(round(float(v) / div))
+    except (TypeError, ValueError): return 0
+
+
+def _iso_secs(v):
+    """'PT3M35S' -> 215"""
+    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", v or "")
+    return int(int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + float(m.group(3) or 0)) if m else 0
 
 
 def _meta(page, key):
@@ -60,7 +74,8 @@ def _spotify(url):
         if isinstance(d.get("trackList"), list):
             for t in d["trackList"]:
                 if t.get("title"):
-                    tracks.append((t["title"].strip(), (t.get("subtitle") or "").replace("\xa0", " ").strip()))
+                    tracks.append((t["title"].strip(), (t.get("subtitle") or "").replace("\xa0", " ").strip(),
+                                   _secs(t.get("duration"), 1000)))
             break
     return title or _meta_title(page), tracks
 
@@ -74,7 +89,7 @@ def _apple_album_api(url):
     for r in data.get("results", []):
         if r.get("wrapperType") == "collection": title = r.get("collectionName", "")
         elif r.get("wrapperType") == "track" and r.get("trackName"):
-            tracks.append((r["trackName"], r.get("artistName", "")))
+            tracks.append((r["trackName"], r.get("artistName", ""), _secs(r.get("trackTimeMillis"), 1000)))
     return title, tracks
 
 
@@ -97,13 +112,13 @@ def _apple(url):
                         by = t.get("byArtist")
                         by = by[0] if isinstance(by, list) and by else by
                         artist = by.get("name", "") if isinstance(by, dict) else ""
-                        tracks.append((t["name"].strip(), artist.strip()))
+                        tracks.append((t["name"].strip(), artist.strip(), _iso_secs(t.get("duration"))))
     if not tracks:                                                # fallback: embedded app data
         m = re.search(r'<script[^>]+id="serialized-server-data"[^>]*>(.*?)</script>', page, re.S)
         if m:
             for d in _walk(json.loads(m.group(1))):
                 if isinstance(d.get("title"), str) and isinstance(d.get("artistName"), str):
-                    tracks.append((d["title"].strip(), d["artistName"].strip()))
+                    tracks.append((d["title"].strip(), d["artistName"].strip(), 0))
     title = _meta(page, "apple:title")
     if not title:
         title = re.sub(r"\s+by\s+.*?\s+on\s+Apple\s+Music.*$", "", _meta_title(page), flags=re.I)
@@ -115,12 +130,12 @@ def fetch_music_playlist(url):
     """Return (folder_name, [(display_name, 'ytsearch1:...'), ...])."""
     title, tracks = _spotify(url) if SPOTIFY_RE.search(url) else _apple(url)
     seen, items = set(), []
-    for name, artist in tracks:
+    for name, artist, dur in tracks:
         key = (name.lower(), artist.lower())
         if key in seen: continue
         seen.add(key)
         name = re.sub(r"\s*[\(\[]\s*mixed\s*[\)\]]\s*$", "", name, flags=re.I)   # DJ-mix suffix hurts matching
         label = f"{artist} - {name}" if artist else name
-        items.append((label, f"ytsearch1:{label}"))
+        items.append((label, f"ytsearch1:{label}" + (f" ||dur={dur}" if dur else "")))   # dur = real track length (s)
     if not items: raise RuntimeError("No tracks found. The playlist must be public.")
     return safe_folder_name(title), items

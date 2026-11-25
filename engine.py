@@ -1,5 +1,6 @@
 """FlowGet engine: downloads, yt-dlp integration, settings, queue persistence, updates."""
-import os, sys, re, json, time, threading, subprocess, zipfile, tempfile, shutil, hashlib, logging
+import shlex
+import os, sys, re, json, time, threading, subprocess, zipfile, tempfile, shutil, hashlib, logging, ctypes
 import urllib.request, urllib.parse
 
 APP_NAME = "FlowGet"
@@ -109,7 +110,7 @@ def valid_url(u):
 
 def unique_path(p):
     base, ext = os.path.splitext(p)
-    i = 1
+    i = 2
     while os.path.exists(p) or os.path.exists(p + ".part"):
         p = f"{base} ({i}){ext}"; i += 1
     return p
@@ -137,14 +138,14 @@ def fetch(url, dest, cb=None):
 
 # ---------------------------------------------------------------- tasks
 PERSIST = ("url", "kind", "folder", "name", "size", "done", "status", "err", "quality", "fmt",
-           "path", "ranged", "segs", "etag")
+           "path", "ranged", "segs", "etag", "resolved", "stage")
 
 
 class Task:
     def __init__(s, url, kind, folder, quality="best", fmt=""):
         s.url, s.kind, s.folder, s.quality, s.fmt = url, kind, folder, quality, fmt  # kind: file|video|audio
         s.name = url[:70]; s.size = 0; s.done = 0; s.speed = 0.0; s.last = 0; s._t = 0.0
-        s.status = "Queued"; s.err = ""; s.path = None; s.ranged = False; s.segs = None; s.etag = ""
+        s.status = "Queued"; s.err = ""; s.path = None; s.ranged = False; s.segs = None; s.etag = ""; s.resolved = ""; s.stage = ""
         s.stop = threading.Event(); s.lock = threading.Lock(); s.proc = None; s.thread = None
         s.notified = False; s.want_resume = False; s.fatal = ""
 
@@ -208,14 +209,21 @@ class Task:
 
 
 def cleanup_task(t):
-    """Delete the partial file of a cancelled file download (retries while Windows still holds it)."""
-    if t.kind != "file" or t.status == "Completed" or not t.path:
-        return
-    part = t.path + ".part"
+    """Delete the partial data of a cancelled download (retries while Windows still holds it)."""
+    if t.status == "Completed": return
+    if t.kind == "file":
+        if not t.path: return
+        target, is_dir = t.path + ".part", False
+    else:
+        if not t.stage: return
+        target, is_dir = stage_dir(t), True
     def work():
         for _ in range(10):
             try:
-                if os.path.exists(part): os.remove(part)
+                if is_dir: shutil.rmtree(target)
+                elif os.path.exists(target): os.remove(target)
+                return
+            except FileNotFoundError:
                 return
             except OSError:
                 time.sleep(1)
@@ -384,11 +392,78 @@ def is_search(t):
     return t.url.startswith("ytsearch1:")                         # Spotify / Apple Music track lookups
 
 
-def media_cmd(t):
+def parse_search(url):
+    """'ytsearch1:Artist - Title ||dur=215' -> ('Artist - Title', 215)"""
+    body, dur = url[len("ytsearch1:"):], 0
+    if " ||dur=" in body:
+        body, _, d = body.rpartition(" ||dur=")
+        dur = int(d) if d.isdigit() else 0
+    return body.strip(), dur
+
+
+_BAD = ("live", "cover", "remix", "karaoke", "instrumental", "slowed", "sped up", "speed up", "reverb", "nightcore",
+        "8d", "reaction", "tutorial", "lesson", "mashup", "acoustic", "bass boosted", "extended", "loop", "1 hour")
+
+
+def pick_best(cands, label, dur):
+    """Choose the YouTube result most likely to be the original track.
+    cands: [{id, title, duration, channel}]. Prefers matching length, official 'Topic' uploads, and avoids
+    live / cover / remix / sped-up versions unless the wanted title itself says so."""
+    want = label.lower(); best, best_score = None, None
+    for i, c in enumerate(cands):
+        title = (c.get("title") or "").lower(); chan = (c.get("channel") or c.get("uploader") or "").lower()
+        if not c.get("id"): continue
+        score = i * 1.5                                           # search rank still counts a little
+        cd = c.get("duration")
+        if dur and cd: score += abs(cd - dur) * (1 if abs(cd - dur) <= 12 else 3)
+        elif dur: score += 40                                     # unknown length: be suspicious
+        if chan.endswith("- topic"): score -= 15                  # official auto-generated audio
+        if "official audio" in title: score -= 8
+        if "lyric" in title: score += 3
+        score += sum(60 for w in _BAD if re.search(rf"\b{re.escape(w)}\b", title) and not re.search(rf"\b{re.escape(w)}\b", want))
+        if best_score is None or score < best_score: best, best_score = c, score
+    return best
+
+
+def resolve_search(t):
+    """Find the exact YouTube video for a Spotify/Apple track (runs once per task, result is saved)."""
+    label, dur = parse_search(t.url)
+    out = subprocess.run([YTDLP, "-J", "--flat-playlist", "--no-warnings"] + cookies_args() + js_args() +
+                         [f"ytsearch8:{label}"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         timeout=90, creationflags=NOWIN)
+    if out.returncode != 0: raise RuntimeError((out.stderr or "search failed").strip().splitlines()[-1][:160])
+    best = pick_best(json.loads(out.stdout).get("entries") or [], label, dur)
+    if not best: raise RuntimeError("No match found on YouTube")
+    t.resolved = best["id"]
+    log.info("match for %r (%ss): %r %ss", label, dur, best.get("title"), best.get("duration"))
+
+
+def stage_dir(t):
+    """Private folder where yt-dlp works; finished files are moved out with a unique name (never overwrite/skip)."""
+    return os.path.join(t.folder, ".flowget-" + t.stage)
+
+
+def finalize_media(t):
+    """Move the finished file(s) from the staging folder into t.folder as 'name.ext', 'name (2).ext', 'name (3).ext'..."""
+    stage = stage_dir(t); moved = {}
+    if not os.path.isdir(stage): return
+    with _path_lock:                                               # two downloads can't pick the same name
+        for fn in sorted(os.listdir(stage)):
+            if fn.endswith((".part", ".ytdl", ".temp")) or re.search(r"\.f\d+\.", fn): continue
+            dst = unique_path(os.path.join(t.folder, fn))
+            shutil.move(os.path.join(stage, fn), dst); moved[fn] = dst
+    if t.path and os.path.basename(t.path) in moved: t.path = moved[os.path.basename(t.path)]
+    elif moved: t.path = next(iter(moved.values()))
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+def media_cmd(t, extra=()):
     out_tpl = "%(title).150s.%(ext)s"
+    label = ""
     if is_search(t):                                              # name the file "Artist - Title"
-        out_tpl = safe_name(t.url[len("ytsearch1:"):]).replace("%", "%%") + ".%(ext)s"
-    cmd = [YTDLP, "--newline", "--no-playlist", "--ffmpeg-location", BIN, "-P", t.folder,
+        label = parse_search(t.url)[0]
+        out_tpl = safe_name(label).replace("%", "%%") + ".%(ext)s"
+    cmd = [YTDLP, "--newline", "--no-playlist", "--ffmpeg-location", BIN, "-P", stage_dir(t),
            "-o", out_tpl, "--windows-filenames", "--retries", "10", "--fragment-retries", "10",
            "--concurrent-fragments", "4",
            "--progress-template",
@@ -396,7 +471,7 @@ def media_cmd(t):
            "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.title)s"]
     if get_int("speed_kbps", 0, 10_000_000):
         cmd += ["-r", f"{get_int('speed_kbps', 0, 10_000_000)}K"]
-    cmd += cookies_args() + js_args()
+    cmd += cookies_args() + js_args() + list(extra)
     if t.kind == "audio":
         cmd += ["-f", "ba/b", "-x", "--audio-format", t.fmt or "mp3", "--audio-quality", "0"]
     else:
@@ -406,15 +481,28 @@ def media_cmd(t):
         cmd += ["-f", sel, "--merge-output-format", fmt]
         if fmt == "mp4":
             cmd += ["-S", "ext:mp4:m4a"]                          # prefer MP4-compatible codecs
-    cmd.append(t.url)
+    if label and t.kind == "audio":                               # tag the file with the real artist / title
+        artist, _, title = label.partition(" - ")
+        if title: cmd += ["--postprocessor-args", "ffmpeg:" + " ".join(
+            ["-metadata", shlex.quote("title=" + title), "-metadata", shlex.quote("artist=" + artist)])]
+    cmd.append(f"https://www.youtube.com/watch?v={t.resolved}" if label and t.resolved
+               else ("ytsearch1:" + label if label else t.url))
     return cmd
 
 
-def run_media(t):
+def run_media(t, extra=()):
     tools_ready.wait()
     if not os.path.exists(YTDLP):
         raise RuntimeError("Media engine missing - check your internet connection and restart")
-    cmd = media_cmd(t)
+    if is_search(t) and not t.resolved:
+        try: resolve_search(t)
+        except Exception as ex: log.warning("match search failed (%s), using plain search", ex)   # falls back to ytsearch1
+    if not t.stage: t.stage = os.urandom(4).hex()
+    os.makedirs(stage_dir(t), exist_ok=True)
+    if os.name == "nt":
+        try: ctypes.windll.kernel32.SetFileAttributesW(stage_dir(t), 2)     # hidden
+        except Exception: pass
+    cmd = media_cmd(t, extra)
     log.info("yt-dlp: %s", " ".join(cmd[:-1]) + " <url>")
     t.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               encoding="utf-8", errors="replace", creationflags=NOWIN)
@@ -445,9 +533,22 @@ def run_media(t):
     if t.stop.is_set():
         t.status = "Paused"
     elif rc == 0 or done_already:
-        t.status = "Completed"; t.size = t.size or t.done
+        try:
+            finalize_media(t)
+        except Exception as ex:
+            log.exception("could not move finished file")
+            t.status, t.err = "Error", "Could not save the file: " + str(ex)[:150]
+        else:
+            t.status = "Completed"; t.size = t.size or t.done
     else:
-        t.status, t.err = "Error", (errline or last)[:200]
+        err = (errline or last)[:200]
+        if "403" in err and not extra:                              # site blocked a plain request: retry posing as Chrome
+            log.info("yt-dlp: HTTP 403, retrying with browser impersonation")
+            t.done = t.size = 0
+            return run_media(t, ["--impersonate", "chrome"])
+        if extra and "mpersonat" in err:
+            err = "HTTP 403 and browser impersonation is unavailable - update yt-dlp (Updates) or set cookies to Firefox"
+        t.status, t.err = "Error", err
 
 
 def fetch_playlist(url):
@@ -612,20 +713,27 @@ def vt(v):
 
 
 def latest_release():
-    """Returns {'version','url','sha_url'} if a newer release exists, else None."""
+    """Returns {'version','url','sha_url'} if a newer release exists, else None.
+    Reads the release list and takes the highest version that has a Setup file, so a missing 'Latest' label,
+    a pre-release, a draft or a stray non-version tag can never hide (or fake) an update."""
     if "YOUR_USER" in GITHUB_REPO:
         raise RuntimeError("Set GITHUB_REPO in engine.py first")
-    req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+    req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=30",
                                  headers={"User-Agent": UA})
-    d = json.load(urllib.request.urlopen(req, timeout=20))
-    latest = d["tag_name"].lstrip("v")
+    data = json.load(urllib.request.urlopen(req, timeout=20))
+    if isinstance(data, dict): data = [data]
     prefix = f"https://github.com/{GITHUB_REPO}/releases/download/"       # only trust our own release files
-    assets = {a["name"]: a["browser_download_url"] for a in d.get("assets", [])
-              if str(a.get("browser_download_url", "")).startswith(prefix)}
-    name = next((n for n in assets if n.endswith("Setup.exe")), None)
-    if name and vt(latest) > vt(VERSION):
-        return {"version": latest, "url": assets[name], "sha_url": assets.get(name + ".sha256")}
-    return None
+    best = None
+    for d in data if isinstance(data, list) else []:
+        if not isinstance(d, dict) or d.get("draft") or d.get("prerelease"): continue
+        tag = str(d.get("tag_name", "")).lstrip("vV")
+        if not re.fullmatch(r"\d+(\.\d+)*", tag): continue                  # ignore tags like "Flowgetters"
+        assets = {a["name"]: a["browser_download_url"] for a in d.get("assets", [])
+                  if str(a.get("browser_download_url", "")).startswith(prefix)}
+        name = next((n for n in assets if n.endswith("Setup.exe")), None)
+        if name and (best is None or vt(tag) > vt(best["version"])):
+            best = {"version": tag, "url": assets[name], "sha_url": assets.get(name + ".sha256")}
+    return best if best and vt(best["version"]) > vt(VERSION) else None
 
 
 def download_verified(url, sha_url, dest, cb=None):
