@@ -62,7 +62,7 @@ def _meta_title(page):
 def _spotify(url):
     kind, pid = SPOTIFY_RE.search(url).groups()
     page = _get(f"https://open.spotify.com/embed/{kind.lower()}/{pid}")
-    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page, re.S)
+    m = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', page, re.S)
     if not m: raise RuntimeError("Spotify page format not recognised (is the playlist public?)")
     data = json.loads(m.group(1))
     title, tracks = "", []
