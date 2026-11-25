@@ -1,7 +1,8 @@
 """FlowGet engine: downloads, yt-dlp integration, settings, queue persistence, updates."""
 import shlex
+import torrent_dl as TD
 import os, sys, re, json, time, threading, subprocess, zipfile, tempfile, shutil, hashlib, logging, ctypes
-import urllib.request, urllib.parse
+import urllib.request, urllib.parse, http.client, socket, ipaddress, itertools, functools
 
 APP_NAME = "FlowGet"
 VERSION = "1.4.0"
@@ -34,7 +35,7 @@ log = logging.getLogger("flowget")
 tools_ready = threading.Event()
 
 # ---------------------------------------------------------------- settings
-DEFAULTS = {"max_concurrent": 3, "connections": 8, "speed_kbps": 0, "folder": DEFAULT_DIR,
+DEFAULTS = {"max_concurrent": 4, "connections": 16, "speed_kbps": 0, "folder": DEFAULT_DIR, "bind_ips": "", "torrent_upload_kbps": 0,
             "cookies_browser": "", "clipboard": True, "notify": True,
             "auto_engine_update": True, "tools_checked": 0, "ffmpeg_built": "", "theme": "dark", "geometry": ""}
 settings = dict(DEFAULTS)
@@ -82,6 +83,64 @@ def get_int(key, lo, hi):
     return max(lo, min(hi, v))
 
 
+# ---------------------------------------------------------------- network adapters / speed sharing
+_rr = itertools.count()
+_active = set()                                                   # tasks currently running (for the fair-share limit)
+_active_lock = threading.Lock()
+_openers = {}
+
+
+def active_count():
+    return max(1, len(_active))
+
+
+def bind_ips():
+    """Local IPv4 addresses from Settings ('Network adapters'). Empty list = let Windows choose."""
+    out = []
+    for p in re.split(r"[,\s;]+", str(settings.get("bind_ips", "") or "")):
+        try: ip = str(ipaddress.IPv4Address(p))
+        except ValueError: continue
+        if ip not in out: out.append(ip)
+    return out
+
+
+def detect_ips():
+    """IPv4 addresses of this PC's adapters that can actually reach the internet (Wi-Fi, LAN, hotspot...)."""
+    cand = set()
+    try:
+        for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET): cand.add(i[4][0])
+    except OSError: pass
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["ipconfig"], capture_output=True, text=True, errors="replace",
+                                 timeout=10, creationflags=NOWIN).stdout
+            cand.update(re.findall(r"IPv4[^:\n]*:\s*(\d+\.\d+\.\d+\.\d+)", out))
+        except Exception: pass
+    good = []
+    for ip in sorted(cand):
+        if ip.startswith(("127.", "169.254.")): continue
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(2)
+            s.bind((ip, 0)); s.connect(("1.1.1.1", 443)); s.close(); good.append(ip)
+        except OSError: pass
+    return good
+
+
+def open_url(req, timeout=30, src=None):
+    """urlopen that can leave through a chosen network adapter (src = that adapter's local IP)."""
+    if not src: return urllib.request.urlopen(req, timeout=timeout)
+    op = _openers.get(src)
+    if op is None:
+        class _H(urllib.request.HTTPHandler):
+            def http_open(self, rq):
+                return self.do_open(functools.partial(http.client.HTTPConnection, source_address=(src, 0)), rq)
+        class _S(urllib.request.HTTPSHandler):
+            def https_open(self, rq):
+                return self.do_open(functools.partial(http.client.HTTPSConnection, source_address=(src, 0)), rq)
+        op = _openers[src] = urllib.request.build_opener(_H, _S)
+    return op.open(req, timeout=timeout)
+
+
 def fmt_size(n):
     n = float(n or 0)
     for u in ("B", "KB", "MB", "GB", "TB"):
@@ -102,7 +161,12 @@ def safe_name(n):
     return n
 
 
+def is_magnet_name(t):
+    return TD.is_magnet(t.url) and (t.name == t.url[:70] or not t.name)
+
+
 def valid_url(u):
+    if TD.is_magnet(u) or (u.lower().endswith(".torrent") and os.path.isfile(u)): return True   # magnet link / local .torrent
     try: p = urllib.parse.urlparse(u)
     except ValueError: return False
     return p.scheme in ("http", "https") and bool(p.netloc) and not re.search(r"\s", u)
@@ -147,7 +211,7 @@ class Task:
         s.name = url[:70]; s.size = 0; s.done = 0; s.speed = 0.0; s.last = 0; s._t = 0.0
         s.status = "Queued"; s.err = ""; s.path = None; s.ranged = False; s.segs = None; s.etag = ""; s.resolved = ""; s.stage = ""
         s.stop = threading.Event(); s.lock = threading.Lock(); s.proc = None; s.thread = None
-        s.notified = False; s.want_resume = False; s.fatal = ""
+        s.notified = False; s.want_resume = False; s.fatal = ""; s.ip_off = next(_rr); s.info = ""
 
     def add(s, n):
         with s.lock:
@@ -176,11 +240,14 @@ class Task:
         return True
 
     def _run(s):
+        with _active_lock: _active.add(s)
         try:
-            (run_http if s.kind == "file" else run_media)(s)
+            (run_http if s.kind == "file" else run_torrent if s.kind == "torrent" else run_media)(s)
         except Exception as e:
             s.status, s.err = "Error", str(e)[:200]
             log.exception("task failed: %s", s.url)
+        finally:
+            with _active_lock: _active.discard(s)
         if s.want_resume and s.status == "Paused":                 # Resume was pressed while we were still stopping
             s.want_resume = False; s.status = "Queued"
 
@@ -211,6 +278,8 @@ class Task:
 def cleanup_task(t):
     """Delete the partial data of a cancelled download (retries while Windows still holds it)."""
     if t.status == "Completed": return
+    if t.kind == "torrent":
+        TD.discard(t); return
     if t.kind == "file":
         if not t.path: return
         target, is_dir = t.path + ".part", False
@@ -271,14 +340,17 @@ def http_probe(t):
 
 def seg_worker(t, g):
     tries = 0
+    idx = next((i for i, x in enumerate(t.segs) if x is g), 0)
     while not t.stop.is_set() and not g["d"] and tries < 8:
         try:
             h = {"User-Agent": UA}
             if t.ranged:
                 h["Range"] = f"bytes={g['p']}-{g['e']}"
                 if t.etag: h["If-Range"] = t.etag                   # server answers 200 if the file changed
-            t0 = time.time(); sent = 0
-            with urllib.request.urlopen(urllib.request.Request(t.url, headers=h), timeout=30) as r, \
+            ips = bind_ips()                                      # segments are spread over every adapter; a failing one
+            src = ips[(idx + t.ip_off + tries // 2) % len(ips)] if ips else None   # hands its segment to the next adapter
+            nxt = time.time()
+            with open_url(urllib.request.Request(t.url, headers=h), 30, src) as r, \
                     open(part_of(t), "r+b") as f:
                 if t.ranged and (r.status != 206 or
                                  not (r.headers.get("Content-Range") or "").startswith(f"bytes {g['p']}-")):
@@ -286,19 +358,19 @@ def seg_worker(t, g):
                                  "Remove this item and add the link again.")
                 f.seek(g["p"])
                 while not t.stop.is_set():
-                    b = r.read(65536)
+                    lim = get_int("speed_kbps", 0, 10_000_000) * 1024
+                    rate = lim / active_count() / (sum(1 for x in t.segs if not x["d"]) or 1) if lim else 0
+                    b = r.read(int(max(4096, min(262144, rate * 0.2))) if rate else 262144)   # small reads keep a limit smooth
                     if not b:
                         if g["e"] < 0 or g["p"] > g["e"]:
                             g["d"] = True
                             return
                         raise IOError("truncated")
                     f.write(b); g["p"] += len(b); t.add(len(b)); tries = 0
-                    lim = get_int("speed_kbps", 0, 10_000_000) * 1024
-                    if lim:                                       # global limit shared by the unfinished segments
-                        left = sum(1 for x in t.segs if not x["d"]) or 1
-                        sent += len(b)
-                        wait = sent / (lim / left) - (time.time() - t0)
-                        if wait > 0: time.sleep(min(wait, 1))
+                    if rate:                                      # total limit split evenly: per download, then per segment
+                        nxt = max(nxt, time.time()) + len(b) / rate
+                        while not t.stop.is_set() and nxt - time.time() > 0:
+                            time.sleep(min(nxt - time.time(), 0.25))
         except _Fatal as e:
             t.fatal = str(e); t.stop.set(); return
         except Exception as e:
@@ -370,6 +442,11 @@ def run_http(t):
         finalize(t); t.status = "Completed"; t.done = t.size or t.done
     else:
         t.status, t.err = "Error", "Connection failed"
+
+
+# ---------------------------------------------------------------- torrents (libtorrent)
+def run_torrent(t):
+    TD.run(t, sys.modules[__name__])
 
 
 # ---------------------------------------------------------------- media (yt-dlp)
@@ -465,12 +542,14 @@ def media_cmd(t, extra=()):
         out_tpl = safe_name(label).replace("%", "%%") + ".%(ext)s"
     cmd = [YTDLP, "--newline", "--no-playlist", "--ffmpeg-location", BIN, "-P", stage_dir(t),
            "-o", out_tpl, "--windows-filenames", "--retries", "10", "--fragment-retries", "10",
-           "--concurrent-fragments", "4",
+           "--concurrent-fragments", str(get_int("connections", 1, 16)), "--http-chunk-size", "10M",
            "--progress-template",
            "download:FG|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
            "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.title)s"]
-    if get_int("speed_kbps", 0, 10_000_000):
-        cmd += ["-r", f"{get_int('speed_kbps', 0, 10_000_000)}K"]
+    if get_int("speed_kbps", 0, 10_000_000):                      # total limit split between the downloads running now
+        cmd += ["-r", f"{max(1, get_int('speed_kbps', 0, 10_000_000) // active_count())}K"]
+    ips = bind_ips()
+    if ips: cmd += ["--source-address", ips[t.ip_off % len(ips)]]  # each track leaves through the next adapter in turn
     cmd += cookies_args() + js_args() + list(extra)
     if t.kind == "audio":
         cmd += ["-f", "ba/b", "-x", "--audio-format", t.fmt or "mp3", "--audio-quality", "0"]

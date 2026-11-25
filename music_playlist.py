@@ -20,9 +20,6 @@ def safe_folder_name(name, fallback="Playlist"):
     name = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", name or "")      # invisible direction marks
     name = re.sub(r":\s+", " - ", name)                                         # "A: B" -> "A - B"
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
-    name = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", name or "")      # invisible direction marks
-    name = re.sub(r":\s+", " - ", name)                                         # "A: B" -> "A - B"
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     return name[:100] or fallback
 
 
@@ -65,7 +62,7 @@ def _meta_title(page):
 def _spotify(url):
     kind, pid = SPOTIFY_RE.search(url).groups()
     page = _get(f"https://open.spotify.com/embed/{kind.lower()}/{pid}")
-    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page, re.S)
+    m = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', page, re.S)
     if not m: raise RuntimeError("Spotify page format not recognised (is the playlist public?)")
     data = json.loads(m.group(1))
     title, tracks = "", []

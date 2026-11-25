@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QDialog, QDialogButtonBox,
                                QSpinBox, QCheckBox, QSystemTrayIcon, QMenu, QStyle, QSizePolicy, QStackedWidget)
 import engine as E
 import music_playlist as MP
+import torrent_dl as TD
 
 QUALITY = [("Best", "best"), ("1080p", "1080"), ("720p", "720"), ("480p", "480"), ("360p", "360")]
 VFMT = ["mp4", "mkv", "webm"]
@@ -258,12 +259,13 @@ class DownloadCard(Card):
         if t.status == "Error" and t.err:
             meta = t.err[:140]
         else:
-            tag = {"file": "File", "video": "Video", "audio": "Audio"}.get(t.kind, "")
+            tag = {"file": "File", "video": "Video", "audio": "Audio", "torrent": "Torrent"}.get(t.kind, "")
             size = f"{E.fmt_size(t.done)} / {E.fmt_size(t.size)}" if t.size else E.fmt_size(t.done)
             live = t.status == "Downloading" and t.speed > 0
             meta = f"{tag}  \u2022  {int(pct * 100)}%  \u2022  {size}"
             if live: meta += f"  \u2022  {E.fmt_size(t.speed)}/s"
             if live and t.eta(): meta += f"  \u2022  {t.eta()} left"
+            if t.status == "Downloading" and getattr(t, "info", ""): meta += f"  \u2022  {t.info}"
         label = {"Paused": "Resume", "Error": "Retry", "Completed": "Open"}.get(t.status, "Pause")
         name = t.name if len(t.name) < 70 else t.name[:67] + "..."
         sig = (name, int(pct * 1000), t.status, meta, label, col)
@@ -280,10 +282,20 @@ class SettingsDialog(QDialog):
         super().__init__(parent); s.setWindowTitle("Settings"); s.setMinimumWidth(480)
         st = E.settings
         f = QFormLayout(s); f.setContentsMargins(20, 18, 20, 18); f.setVerticalSpacing(12)
-        s.maxc = QSpinBox(); s.maxc.setRange(1, 10); s.maxc.setValue(st["max_concurrent"])
+        s.maxc = QSpinBox(); s.maxc.setRange(1, 16); s.maxc.setValue(st["max_concurrent"])
         s.conns = QSpinBox(); s.conns.setRange(1, 16); s.conns.setValue(st["connections"])
         s.speed = QSpinBox(); s.speed.setRange(0, 10_000_000); s.speed.setSuffix(" KB/s")
         s.speed.setSpecialValueText("Unlimited"); s.speed.setValue(st["speed_kbps"])
+        s.ips = QLineEdit(st.get("bind_ips", "")); s.ips.setPlaceholderText("Automatic (leave empty)")
+        s.ips.setToolTip("Local IP of each connection to use together, e.g. 192.168.1.20, 192.168.0.15\n"
+                         "Downloads are spread over all of them. This only adds speed when the connections are\n"
+                         "separate internet lines (two ISPs, or Wi-Fi + a phone hotspot). Wi-Fi and LAN on the same\n"
+                         "router share one line, so leave this empty.")
+        det = QPushButton("Detect"); det.clicked.connect(s.detect)
+        ir = QHBoxLayout(); ir.addWidget(s.ips, 1); ir.addWidget(det)
+        s.up = QSpinBox(); s.up.setRange(0, 10_000_000); s.up.setSuffix(" KB/s"); s.up.setSpecialValueText("Unlimited")
+        s.up.setValue(st.get("torrent_upload_kbps", 0))
+        s.up.setToolTip("Upload limit for torrents. Leaving some upload free keeps torrent downloads fast.")
         s.folder = QLineEdit(st["folder"])
         br = QPushButton("Browse"); br.clicked.connect(s.browse)
         fr = QHBoxLayout(); fr.addWidget(s.folder, 1); fr.addWidget(br)
@@ -299,11 +311,24 @@ class SettingsDialog(QDialog):
         s.clip = QCheckBox("Detect links copied to the clipboard"); s.clip.setChecked(st["clipboard"])
         s.notify = QCheckBox("Show notifications when downloads finish"); s.notify.setChecked(st["notify"])
         f.addRow("Downloads at once", s.maxc); f.addRow("Connections per file", s.conns)
-        f.addRow("Speed limit", s.speed); f.addRow("Default folder", fr)
+        f.addRow("Speed limit (total)", s.speed); f.addRow("Network adapters", ir); f.addRow("Torrent upload limit", s.up); f.addRow("Default folder", fr)
         f.addRow("Mode", s.theme); f.addRow("Style", s.style_box); f.addRow("Glass", s.glass)
         f.addRow("Use cookies from", s.cookies); f.addRow("", s.auto); f.addRow("", s.clip); f.addRow("", s.notify)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(s.accept); bb.rejected.connect(s.reject); f.addRow(bb)
+
+    def detect(s):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try: ips = E.detect_ips()
+        finally: QApplication.restoreOverrideCursor()
+        if not ips:
+            QMessageBox.information(s, E.APP_NAME, "No working internet adapter was found."); return
+        if len(ips) == 1:
+            QMessageBox.information(s, E.APP_NAME, f"Only one connection reaches the internet ({ips[0]}).\n"
+                                    "Leave this empty to use it automatically."); return
+        s.ips.setText(", ".join(ips))
+        QMessageBox.information(s, E.APP_NAME, "Found " + str(len(ips)) + " connections: " + ", ".join(ips) +
+                                "\n\nThey only add speed if they are separate internet lines (not the same router).")
 
     def browse(s):
         d = QFileDialog.getExistingDirectory(s, "Default folder", s.folder.text())
@@ -312,7 +337,7 @@ class SettingsDialog(QDialog):
     def apply(s):
         c = s.cookies.currentText()
         E.settings.update(max_concurrent=s.maxc.value(), connections=s.conns.value(), speed_kbps=s.speed.value(),
-                          folder=s.folder.text().strip() or E.DEFAULT_DIR, cookies_browser="" if c == "None" else c,
+                          folder=s.folder.text().strip() or E.DEFAULT_DIR, bind_ips=s.ips.text().strip(), torrent_upload_kbps=s.up.value(), cookies_browser="" if c == "None" else c,
                           clipboard=s.clip.isChecked(), notify=s.notify.isChecked(),
                           auto_engine_update=s.auto.isChecked(), theme=s.theme.currentText().lower(),
                           style=s.style_box.currentText(), glass=s.glass.currentText())
@@ -480,7 +505,7 @@ class Main(QWidget):
 
         add = Card(); al = QVBoxLayout(add); al.setContentsMargins(16, 14, 16, 14); al.setSpacing(10)
         s.txt = QPlainTextEdit(); s.txt.setFixedHeight(84)
-        s.txt.setPlaceholderText("Paste one or more links - one per line (files, YouTube, audio, video...)")
+        s.txt.setPlaceholderText("Paste one or more links - one per line (files, YouTube, audio, video, magnet links, .torrent...)")
         al.addWidget(s.txt)
         opts = QHBoxLayout(); opts.setSpacing(8)
         s.kind = QComboBox(); s.kind.addItems(["Auto", "Direct file", "Video", "Audio"])
@@ -494,8 +519,9 @@ class Main(QWidget):
         dest = QHBoxLayout(); dest.setSpacing(8)
         s.folder = QLineEdit(E.settings["folder"])
         br = QPushButton("Browse"); br.clicked.connect(s.browse)
+        tb = QPushButton(".torrent"); tb.setToolTip("Add one or more .torrent files from your PC"); tb.clicked.connect(s.pick_torrent)
         go = QPushButton("Add downloads"); go.setObjectName("accent"); go.clicked.connect(s.add_urls)
-        dest.addWidget(s.folder, 1); dest.addWidget(br); dest.addWidget(go); al.addLayout(dest)
+        dest.addWidget(s.folder, 1); dest.addWidget(br); dest.addWidget(tb); dest.addWidget(go); al.addLayout(dest)
         content.addWidget(add)
 
         bar = QHBoxLayout(); bar.setSpacing(8)
@@ -655,7 +681,9 @@ class Main(QWidget):
 
     def dropEvent(s, e):
         m = e.mimeData(); found = []
-        if m.hasUrls(): found += [u.toString() for u in m.urls() if u.scheme() in ("http", "https")]
+        if m.hasUrls():
+            found += [u.toString() for u in m.urls() if u.scheme() in ("http", "https")]
+            found += [os.path.normpath(u.toLocalFile()) for u in m.urls() if u.isLocalFile() and u.toLocalFile().lower().endswith(".torrent")]
         if m.hasText(): found += [l.strip() for l in m.text().splitlines() if E.valid_url(l.strip())]
         cur = s.txt.toPlainText().split(); new = []
         for u in found:
@@ -709,8 +737,16 @@ class Main(QWidget):
         d = QFileDialog.getExistingDirectory(s, "Save to", s.folder.text())
         if d: s.folder.setText(os.path.normpath(d))
 
+    def pick_torrent(s):
+        files, _ = QFileDialog.getOpenFileNames(s, "Choose .torrent files", "", "Torrent files (*.torrent)")
+        if files:
+            cur = s.txt.toPlainText().strip()
+            s.txt.setPlainText((cur + "\n" if cur else "") + "\n".join(os.path.normpath(f) for f in files))
+
     def make_task(s, url, media_only=False):
         k = s.kind.currentText()
+        if TD.is_torrent_link(url) and (k != "Direct file" or TD.is_magnet(url) or os.path.isfile(url)):
+            return E.Task(url, "torrent", os.path.normpath(s.folder.text().strip() or E.DEFAULT_DIR))
         if k == "Audio":
             kind = "audio"
         elif k == "Video" or (media_only and k != "Audio"):
@@ -726,15 +762,17 @@ class Main(QWidget):
 
     def add_urls(s):
         lines = [l.strip() for l in s.txt.toPlainText().splitlines() if l.strip()]
-        links = [l for l in lines if E.valid_url(l)]
+        links = [l for l in lines if E.valid_url(l)]; n_valid = len(links)
         if not links:
-            QMessageBox.warning(s, E.APP_NAME, "Paste at least one valid http(s) link."); return
+            QMessageBox.warning(s, E.APP_NAME, "Paste at least one valid http(s) link, magnet link or .torrent file."); return
         folder = os.path.normpath(s.folder.text().strip() or E.DEFAULT_DIR)
         try:
             os.makedirs(folder, exist_ok=True)
         except OSError as e:
             QMessageBox.warning(s, E.APP_NAME, f"Can't use that save folder:\n{e}"); return
         s.folder.setText(folder)
+        for u in [l for l in links if TD.is_torrent_link(l) and (s.kind.currentText() != "Direct file" or TD.is_magnet(l) or os.path.isfile(l))]:
+            links.remove(u); s.add_task(s.make_task(u))                  # magnet links / .torrent files go straight to the torrent engine
         music = [l for l in links if MP.is_music_link(l)]             # Spotify / Apple Music playlists
         if music:
             links = [l for l in links if l not in music]
@@ -749,8 +787,8 @@ class Main(QWidget):
                 threading.Thread(target=s._read_playlist, args=(u,), daemon=True).start()
         else:
             for u in links: s.add_task(s.make_task(u))
-        if len(lines) > len(links):
-            s.sig_msg.emit(f"Skipped {len(lines) - len(links)} line(s) that are not valid http(s) links")
+        if len(lines) > n_valid:
+            s.sig_msg.emit(f"Skipped {len(lines) - n_valid} line(s) that are not valid http(s) links")
         s.txt.clear()
 
     def _read_playlist(s, url):
@@ -853,7 +891,7 @@ class Main(QWidget):
             if i is item: s.open_task(t)
 
     def tick(s):
-        cap = E.get_int("max_concurrent", 1, 10)
+        cap = E.get_int("max_concurrent", 1, 16)
         running = sum(1 for t, _, _ in s.rows if t.status == "Downloading" or t.alive())
         down = queued = 0; total = 0.0
         for t, _, card in s.rows:
