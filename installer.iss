@@ -1,23 +1,27 @@
+
 #define MyAppName "FlowGet"
 #define MyAppVersion "1.4.0"
 #ifndef IconDir
-  #define IconDir "assets"
+  #define IconDir "files-logo"
 #endif
 
 [Setup]
 AppId={{6F1D2C3B-8A47-4E59-B0C2-1A9E5D7F3B42}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+AppPublisher=FlowGet
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=dist
 OutputBaseFilename=FlowGet-Setup
-Compression=lzma
 SetupIconFile={#IconDir}\icon.ico
+UninstallDisplayIcon={app}\FlowGet.exe
+Compression=lzma
 SolidCompression=yes
+WizardStyle=modern
 PrivilegesRequired=lowest
 CloseApplications=yes
-UninstallDisplayIcon={app}\FlowGet.exe
+ArchitecturesInstallIn64BitMode=x64
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
